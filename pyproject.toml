@@ -4,15 +4,16 @@ version = "1.0.0"
 requires-python = ">=3.9"
 description = "FednnUNet is a nnUNet library wrapper for federated image segmentation."
 readme = "readme.md"
-license = { file = "LICENSE" }
-
+license = { text = "Proprietary" }
 
 [build-system]
-requires = ["setuptools>=67.8.0"]
+requires = ["setuptools>=67.8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+packages = ["fednnunet"]
 
 [tool.codespell]
-skip = '.git,*.pdf,*.svg'
+skip = ".git,*.pdf,*.svg"
 #
 # ignore-words-list = ''
