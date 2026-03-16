@@ -124,7 +124,7 @@ for fold in folds:
             if task == "plan_and_preprocess":
                 command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} -d {client_dataset} {optional_args}"
             elif task == "train":
-                command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} {client_dataset} {configuration} {fold} {optional_args}"
+                command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} {client_dataset} {configuration} {fold} -device cpu {optional_args}"
             print(command)
             client_processes.append(subprocess.Popen(command, shell=True))
 
@@ -141,3 +141,6 @@ for fold in folds:
             client_process.wait()
 
         print("Server and clients stopped")
+
+# python fednnunet/run.py plan_and_preprocess "301 302" 3d_fullres --port 8080 -np 1 -npfp 1
+# python fednnunet/run.py train "301 302" 3d_fullres 0 --port 8080

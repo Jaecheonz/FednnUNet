@@ -60,7 +60,6 @@ def run_training(
             fold,
             trainer_class_name,
             plans_identifier,
-            use_compressed_data,
             device=device,
         )
 

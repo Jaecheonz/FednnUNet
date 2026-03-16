@@ -169,3 +169,19 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+"""
+rm -rf nnUNet_data/nnUNet_raw/Dataset301_BraTSA
+rm -rf nnUNet_data/nnUNet_raw/Dataset302_BraTSB
+rm -rf nnUNet_data/nnUNet_preprocessed/Dataset301_BraTSA
+rm -rf nnUNet_data/nnUNet_preprocessed/Dataset302_BraTSB
+rm -rf nnUNet_data/nnUNet_results/Dataset301_BraTSA
+rm -rf nnUNet_data/nnUNet_results/Dataset302_BraTSB
+
+python fednnunet/dataset_conversion/convert_brats_fed.py -i data --start_dataset_id 301 --num_sites 2
+
+find nnUNet_data/nnUNet_raw/Dataset301_BraTSA/labelsTr -type f | wc -l
+find nnUNet_data/nnUNet_raw/Dataset302_BraTSB/labelsTr -type f | wc -l
+
+python fednnunet/run.py plan_and_preprocess "301 302" 3d_fullres --port 8080 -np 1 -npfp 1
+"""

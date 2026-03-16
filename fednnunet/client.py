@@ -303,8 +303,11 @@ if args.task == "train":
         device = torch.device("cpu")
     elif args.device == "cuda":
         # multithreading in torch doesn't help nnU-Net if run on GPU
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
+        try:
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
         device = torch.device("cuda")
     else:
         device = torch.device("mps")
