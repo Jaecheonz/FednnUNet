@@ -43,7 +43,7 @@ parser.add_argument(
 
 args, unknown = parser.parse_known_args()
 
-datasets = set(args.data_centers)
+datasets = list(args.data_centers)
 num_clients = len(datasets)
 task = args.task
 fold = args.fold
@@ -66,19 +66,19 @@ if task == "extract_fingerprint" or task == "plan_and_preprocess":
 elif fold == "all":
     folds = list(range(5))
 elif fold is None:
-    raise ValueError("Fold must be specified for the {task} task")
+    raise ValueError(f"Fold must be specified for the {task} task")
 else:
     folds = [int(fold)]
 
 configuration = args.configuration
 port = args.port
 
-multi_gpu = True
+multi_gpu = False
 
 # mnms dataset
 # node_mapping = {301: 2, 302: 2, 303: 3, 304: 3, 305: 4}
 # fetal dataset
-node_mapping = {1: 0, 2: 1, 3: 1, 5: 0}
+node_mapping = {301: 0, 302: 0}
 process_prefix = ""
 
 for fold in folds:
@@ -102,6 +102,7 @@ for fold in folds:
                 break
 
         client_processes = []
+        process_prefix = ""
         for client_dataset in datasets:
             print("Starting client " + str(client_dataset))
             if multi_gpu:

@@ -111,3 +111,7 @@ ENV/
 *.jpg
 *.jpeg
 *.arch
+
+# data stuff
+data/
+nnUNet_data/

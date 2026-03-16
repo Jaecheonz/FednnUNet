@@ -26,7 +26,7 @@ def state_dict_to_parameters(state_dict) -> Parameters:
 def bytes_to_state_dict(bytes_data: bytes) -> dict:
     """Converts bytes back to a PyTorch state_dict."""
     bytes_io = BytesIO(bytes_data)
-    return torch.load(bytes_io)
+    return torch.load(bytes_io, weights_only=False)
 
 
 def parameters_to_state_dict(parameters: Parameters) -> dict:

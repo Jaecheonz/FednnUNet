@@ -279,6 +279,7 @@ def client_entry():
             device = torch.device("mps")
     else:
         args.dataset_name_or_id = args.d[0]
+        device = torch.device("cpu")
 
     run_client(args, device)
 

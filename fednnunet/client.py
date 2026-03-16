@@ -328,7 +328,7 @@ def state_dict_to_parameters(state_dict) -> Parameters:
 def bytes_to_state_dict(bytes_data: bytes) -> dict:
     """Converts bytes back to a PyTorch state_dict."""
     bytes_io = BytesIO(bytes_data)
-    return torch.load(bytes_io)
+    return torch.load(bytes_io, weights_only=False)
 
 
 def parameters_to_state_dict(parameters: Parameters) -> dict:
@@ -532,11 +532,16 @@ class FlowerClient(fl.client.Client):
                 )
                 logging.info(f"Experiment plan created for {self.dataset_name}")
                 if self.preprocess_dataset:
+                    num_processes = args.np
+                    if num_processes is None:
+                        default_np = {"2d": 8, "3d_fullres": 4, "3d_lowres": 8}
+                        num_processes = [default_np[c] if c in default_np else 4 for c in args.c]
+
                     preprocess(
                         [self.dataset_id],
                         plans_identifier=plans_identifier,
                         configurations=args.c,
-                        num_processes=args.np,
+                        num_processes=num_processes,
                         verbose=args.verbose,
                     )
                     logging.info(f"Dataset {self.dataset_name} preprocessed")
