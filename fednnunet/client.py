@@ -29,7 +29,8 @@ from nnunetv2.utilities.dataset_name_id_conversion import (
     maybe_convert_to_dataset_name,
 )
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
-
+from pathlib import Path
+from nnunetv2.paths import nnUNet_raw
 from fednnunet.run_training import run_training
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -504,10 +505,13 @@ class FlowerClient(fl.client.Client):
             tl = np.round(
                 self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4
             )
+            dataset_name = self.trainer.plans_manager.dataset_name
+            labels_tr = Path(nnUNet_raw) / dataset_name / "labelsTr"
+            num_examples = len(list(labels_tr.glob("*.nii.gz")))
             fr = FitRes(
                 parameters=self.get_parameters({}).parameters,
                 status=Status(code=Code(0), message=""),
-                num_examples=len(self.trainer.dataloader_train.generator._data),
+                num_examples=num_examples,
                 metrics={"loss": float(tl)},
             )
             return fr
@@ -566,10 +570,13 @@ class FlowerClient(fl.client.Client):
             ][-1]
         ]
 
+        dataset_name = self.trainer.plans_manager.dataset_name
+        labels_tr = Path(nnUNet_raw) / dataset_name / "labelsTr"
+        num_examples = len(list(labels_tr.glob("*.nii.gz")))
         er = EvaluateRes(
             status=Status(code=Code(0), message="yacasi"),
             loss=float(vl),
-            num_examples=len(self.trainer.dataloader_val.generator._data),
+            num_examples=num_examples,
             metrics={"fg_dice": float(np.nanmean(dc))},
         )
 

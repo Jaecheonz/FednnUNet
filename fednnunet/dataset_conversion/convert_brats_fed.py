@@ -185,3 +185,11 @@ find nnUNet_data/nnUNet_raw/Dataset302_BraTSB/labelsTr -type f | wc -l
 
 python fednnunet/run.py plan_and_preprocess "301 302" 3d_fullres --port 8080 -np 1 -npfp 1
 """
+
+
+"""
+python fednnunet/dataset_conversion/convert_brats_fed.py \
+    -i /group/pmc079/jchin/data \
+    --start_dataset_id 301 \
+    --num_sites 2
+"""

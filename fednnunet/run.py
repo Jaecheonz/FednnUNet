@@ -124,7 +124,7 @@ for fold in folds:
             if task == "plan_and_preprocess":
                 command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} -d {client_dataset} {optional_args}"
             elif task == "train":
-                command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} {client_dataset} {configuration} {fold} -device cpu {optional_args}"
+                command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} {client_dataset} {configuration} {fold} -device cuda {optional_args}"
             print(command)
             client_processes.append(subprocess.Popen(command, shell=True))
 
