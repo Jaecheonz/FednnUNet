@@ -375,7 +375,9 @@ class FlowerClient(fl.client.Client):
                 return_trainer=True,
             )
 
-            self.trainer.initialize()
+            if not getattr(self.trainer, "was_initialized", False):
+                self.trainer.initialize()
+
             self.model = self.trainer.network
             self.trainer.on_train_start()
 
@@ -486,28 +488,38 @@ class FlowerClient(fl.client.Client):
                 num_examples=0,
                 metrics={},
             )
-        else:
-            # adding try catch errors
-            try:
-                self.trainer.run_federated_train_round()
-            except ValueError as e:
-                logging.error(f"ValueError occurred: {e}")
-            except RuntimeError as e:
-                logging.error(f"RuntimeError occurred: {e}")
-            except Exception as e:
-                logging.error(f"An unexpected error occurred: {e}")
-                raise
 
-            tl = np.round(
-                self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4
-            )
-            fr = FitRes(
-                parameters=self.get_parameters({}).parameters,
-                status=Status(code=Code(0), message=""),
-                num_examples=len(self.trainer.dataloader_train.generator._data),
-                metrics={"loss": float(tl)},
-            )
-            return fr
+        print(f"[FIT] starting fit for dataset {self.dataset_id}", flush=True)
+
+        try:
+            self.trainer.run_federated_train_round()
+            print(f"[FIT] finished train round for dataset {self.dataset_id}", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[FIT] exception for dataset {self.dataset_id}: {e}", flush=True)
+            traceback.print_exc()
+            raise
+
+        tl = np.round(
+            self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4
+        )
+
+        train_data = self.trainer.dataloader_train.generator._data
+
+        if hasattr(train_data, "keys"):
+            num_examples = len(list(train_data.keys()))
+        elif hasattr(train_data, "_data") and hasattr(train_data._data, "keys"):
+            num_examples = len(list(train_data._data.keys()))
+        else:
+            num_examples = 1
+
+        fr = FitRes(
+            parameters=self.get_parameters({}).parameters,
+            status=Status(code=Code(0), message=""),
+            num_examples=num_examples,
+            metrics={"loss": float(tl)},
+        )
+        return fr
 
     def evaluate(self, ei):
         # We need to update to the aggregated parameters, otherwise the model will be evaluated on local weights
@@ -585,17 +597,17 @@ def run_client(args, device):
         client.trainer.perform_actual_validation()
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
-    client = FlowerClient(task=args.task, args=args)
+#     client = FlowerClient(task=args.task, args=args)
 
-    fl.client.start_client(
-        server_address=f"0.0.0.0:{args.port}",
-        client=client.to_client(),  # <-- where FlowerClient is of type flwr.client.NumPyClient object
-        grpc_max_message_length=2147483647,
-    )
+#     fl.client.start_client(
+#         server_address=f"0.0.0.0:{args.port}",
+#         client=client.to_client(),  # <-- where FlowerClient is of type flwr.client.NumPyClient object
+#         grpc_max_message_length=2147483647,
+#     )
 
-    # Clean up after federated training and perform local validation
-    if args.task == "train":
-        client.trainer.on_train_end()
-        client.trainer.perform_actual_validation()
+#     # Clean up after federated training and perform local validation
+#     if args.task == "train":
+#         client.trainer.on_train_end()
+#         client.trainer.perform_actual_validation()

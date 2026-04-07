@@ -261,7 +261,8 @@ class MyStrategy(fl.server.strategy.FedAvg):
         # If there are no successful results, return None or a default value
         if not successful_results:
             fl.common.logger.log(2, f"Round {rnd} had {len(failures)} failures.")
-            return None  # or some default values
+            print(f"aggregate_fit round {rnd}: successful={len(successful_results)}, failures={len(failures)}", flush=True)
+            return None, {}
 
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             return (

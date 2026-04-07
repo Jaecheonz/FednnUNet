@@ -55,12 +55,11 @@ def run_training(
         raise NotImplementedError("FednnUNet does not support DDP training yet.")
     else:
         nnunet_trainer = get_trainer_from_args(
-            dataset_name_or_id,
-            configuration,
-            fold,
-            trainer_class_name,
-            plans_identifier,
-            use_compressed_data,
+            dataset_name_or_id=dataset_name_or_id,
+            configuration=configuration,
+            fold=fold,
+            trainer_name=trainer_class_name,
+            plans_identifier=plans_identifier,
             device=device,
         )
 

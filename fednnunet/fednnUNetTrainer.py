@@ -13,12 +13,15 @@ class nnUNetTrainer(nnUNetTrainer):
         configuration: str,
         fold: int,
         dataset_json: dict,
-        unpack_dataset: bool = True,
         device: torch.device = torch.device("cuda"),
     ):
         print("Using federated nnUNetTrainer")
         super().__init__(
-            plans, configuration, fold, dataset_json, unpack_dataset, device
+            plans=plans,
+            configuration=configuration,
+            fold=fold,
+            dataset_json=dataset_json,
+            device=device,
         )
 
     def run_federated_train_round(self):

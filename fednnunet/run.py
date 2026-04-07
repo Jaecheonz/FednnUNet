@@ -1,6 +1,9 @@
 import argparse
 import json
 import subprocess
+import sys
+import os
+import time
 
 # Convenience script to run federated training on a multi-gpu cluster
 # Each node (data-center) is spawned on a determined GPU and communicates with server on the provided network port
@@ -78,63 +81,107 @@ multi_gpu = True
 # mnms dataset
 # node_mapping = {301: 2, 302: 2, 303: 3, 304: 3, 305: 4}
 # fetal dataset
-node_mapping = {1: 0, 2: 1, 3: 1, 5: 0}
-process_prefix = ""
+node_mapping = {301: 0, 302: 1}
 
 for fold in folds:
     print(f"Starting {task} for fold {fold}")
+    
+    server_process = None
+    client_processes = []
+    
     try:
         print("Starting server")
+        server_env = os.environ.copy()
         if multi_gpu:
-            process_prefix = "CUDA_VISIBLE_DEVICES=0"
+            server_env["CUDA_VISIBLE_DEVICES"] = "0"
+
+        print(f"Server python: {sys.executable}")
+        server_env["PYTHONUNBUFFERED"] = "1"
+
+        server_log = open(f"server_fold{fold}.log", "w", buffering=1)
+
         server_process = subprocess.Popen(
-            f"{process_prefix} python fednnunet/server.py {task} -n {num_clients} --port {port}",
-            shell=True,
-            stderr=subprocess.PIPE,
+            [
+                sys.executable,
+                "-u",
+                "fednnunet/server.py",
+                task,
+                "-n",
+                str(num_clients),
+                "--port",
+                str(port),
+            ],
+            env=server_env,
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
             text=True,
         )
-        # server_process = subprocess.Popen(f"python server.py {config_path}", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        # print(server_process.stdout)
-        # Break when "ready" is printed
-        for line in server_process.stderr:
-            print(line, end="")  # process line here
-            if "Requesting initial parameters" in line:
-                break
 
-        client_processes = []
+        time.sleep(5)
         for client_dataset in datasets:
             print("Starting client " + str(client_dataset))
+
+            client_env = os.environ.copy()
             if multi_gpu:
                 gpu = node_mapping[client_dataset]
-                process_prefix = f"CUDA_VISIBLE_DEVICES={gpu}"
+                client_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
                 print(
                     f"Running {task} for dataset {client_dataset} with fold {fold} on GPU {gpu}"
                 )
 
-            optional_args = ""
-            # pass the undefined arguments to the client
-            if unknown:
-                optional_args += " ".join(unknown) + " "
-            if gpu_memory_target:
-                optional_args += (
-                    f"-gpu_memory_target {gpu_memory_target_mapping[client_dataset]} "
-                )
+            client_env["PYTHONUNBUFFERED"] = "1"
+
+            command = [
+                sys.executable,
+                "-u",
+                "-m",
+                "fednnunet.client_entrypoints",
+                "--port",
+                str(port),
+                task,
+            ]
 
             if task == "plan_and_preprocess":
-                command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} -d {client_dataset} {optional_args}"
+                command += ["-d", str(client_dataset)]
             elif task == "train":
-                command = f"{process_prefix} python fednnunet/client_entrypoints.py --port {port} {task} {client_dataset} {configuration} {fold} {optional_args}"
-            print(command)
-            client_processes.append(subprocess.Popen(command, shell=True))
+                command += [str(client_dataset), configuration, str(fold)]
 
-        for line in server_process.stderr:
-            print(line, end="")
+            if unknown:
+                command += unknown
+
+            if gpu_memory_target:
+                command += [
+                    "-gpu_memory_target",
+                    str(gpu_memory_target_mapping[client_dataset]),
+                ]
+
+            print(" ".join(command))
+            print(f"Client python: {sys.executable}")
+            client_log = open(f"client_{client_dataset}_fold{fold}.log", "w", buffering=1)
+
+            client_processes.append(
+                subprocess.Popen(
+                    command,
+                    env=client_env,
+                    stdout=client_log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+        time.sleep(3)
+    
+        for i, client_process in enumerate(client_processes):
+            print(f"\n=== Output from client process {i} ===", flush=True)
+            ret = client_process.poll()
+            print(f"Client process {i} current status: {ret}", flush=True)
 
         server_process.wait()
 
     except KeyboardInterrupt:
-        server_process.terminate()
-        server_process.wait()
+        if server_process is not None:
+            server_process.terminate()
+            server_process.wait()
+
         for client_process in client_processes:
             client_process.terminate()
             client_process.wait()

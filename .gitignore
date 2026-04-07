@@ -110,3 +110,4 @@ ENV/
 *.jpg
 *.jpeg
 *.arch
+*.out
