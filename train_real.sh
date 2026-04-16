@@ -2,7 +2,9 @@
 #SBATCH --account=pmc079
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:2
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --time=3-00:00:00
 #SBATCH --job-name=fednnunet_real
 #SBATCH --output=fednnunet_real_%j.out
 
@@ -23,7 +25,6 @@ ENV_PY=/home/jchin/.conda/envs/fednnunet310/bin/python
 
 cd ~/repos/FednnUNet || exit 1
 
-# Make the repo importable as a package
 export PYTHONPATH=$PWD:${PYTHONPATH:-}
 export PYTHONUNBUFFERED=1
 
@@ -40,4 +41,25 @@ $ENV_PY --version
 $ENV_PY -c "import sys, torch, flwr, nnunetv2, fednnunet; print('exe', sys.executable); print('torch', torch.__version__); print('flwr', flwr.__version__); print('nnunetv2 ok', nnunetv2.__file__); print('fednnunet ok', getattr(fednnunet, '__file__', 'namespace-package'))"
 nvidia-smi
 
-$ENV_PY -u -m fednnunet.run train "301 302" 3d_fullres 0 --port 8080 --c
+echo "=== START FEDERATED TRAINING ==="
+$ENV_PY -u -m fednnunet.run train "301 302" 3d_fullres 0 --port 8080
+TRAIN_EXIT=$?
+
+if [ $TRAIN_EXIT -ne 0 ]; then
+    echo "Training failed with exit code $TRAIN_EXIT"
+    exit $TRAIN_EXIT
+fi
+
+echo "=== TRAINING FINISHED, STARTING VALIDATION ==="
+
+# Validation-only pass. This should trigger perform_actual_validation()
+# and create fold_0/validation/summary.json for the resolved trainer output.
+$ENV_PY -u -m fednnunet.run train "301 302" 3d_fullres 0 --val --val_best --port 8080
+VAL_EXIT=$?
+
+if [ $VAL_EXIT -ne 0 ]; then
+    echo "Validation failed with exit code $VAL_EXIT"
+    exit $VAL_EXIT
+fi
+
+echo "=== VALIDATION FINISHED ==="

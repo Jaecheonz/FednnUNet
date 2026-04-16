@@ -24,9 +24,9 @@ def state_dict_to_parameters(state_dict) -> Parameters:
 
 
 def bytes_to_state_dict(bytes_data: bytes) -> dict:
-    """Converts bytes back to a PyTorch state_dict."""
+    """Converts bytes back to a PyTorch state_dict on CPU."""
     bytes_io = BytesIO(bytes_data)
-    return torch.load(bytes_io)
+    return torch.load(bytes_io, map_location=torch.device("cpu"))
 
 
 def parameters_to_state_dict(parameters: Parameters) -> dict:
@@ -174,12 +174,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
     def find_common_layers(self, state_dicts):
         # Find the common keys in all state_dicts
+        if not state_dicts:
+            log(WARNING, "find_common_layers received no state_dicts")
+            return []
 
         common_keys = set(state_dicts[0].keys())
 
         for sd in state_dicts[1:]:
             common_keys.intersection_update(sd.keys())
-            # Print number of keys in this dictionary
             log(INFO, f"Number of keys in this dictionary: {len(sd.keys())}")
 
         log(INFO, f"Number of common keys: {len(common_keys)}")
@@ -190,8 +192,8 @@ class MyStrategy(fl.server.strategy.FedAvg):
             dimensions = [sd[key].shape for sd in state_dicts]
             if all(dim == dimensions[0] for dim in dimensions):
                 compatible_keys.append(key)
-        log(INFO, f"Number of compatible keys: {len(compatible_keys)}")
 
+        log(INFO, f"Number of compatible keys: {len(compatible_keys)}")
         return compatible_keys
 
     def create_compatible_state_dict(self, state_dicts, compatible_keys):
@@ -230,6 +232,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
             )
             for client in clients
         ]
+
+        if not parms:
+            log(WARNING, f"Round {server_round}: no client parameters received in configure_fit")
+            return []
+
         for idx, sd in enumerate(parms):
             torch.save(
                 sd,
@@ -240,8 +247,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         compatible_keys = self.find_common_layers(parms)
 
-        # here we are doing the merging already...
-        new_state_dict = self.create_compatible_state_dict(parms, compatible_keys)
+        if not compatible_keys:
+            log(WARNING, f"Round {server_round}: no compatible keys found across clients")
+        else:
+            # Keep this if you still want the compatibility check/merge side effect
+            new_state_dict = self.create_compatible_state_dict(parms, compatible_keys)
 
         # Return client/config pairs
         return [(client, fit_ins) for client in clients]
@@ -286,15 +296,19 @@ class MyStrategy(fl.server.strategy.FedAvg):
         )
 
     def aggregate_weights(self, results):
-
         dicts = [parameters_to_state_dict(res[1].parameters) for res in results]
+
+        if not dicts:
+            log(WARNING, "aggregate_weights received no client results")
+            return None
 
         compatible_keys = self.find_common_layers(dicts)
 
-        # here we are doing the merging already...
-        new_state_dict = self.create_compatible_state_dict(dicts, compatible_keys)
+        if not compatible_keys:
+            log(WARNING, "aggregate_weights found no compatible keys")
+            return None
 
-        # Implement weight aggregation logic
+        new_state_dict = self.create_compatible_state_dict(dicts, compatible_keys)
         return state_dict_to_parameters(new_state_dict)
 
 

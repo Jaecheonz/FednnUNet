@@ -326,9 +326,9 @@ def state_dict_to_parameters(state_dict) -> Parameters:
 
 
 def bytes_to_state_dict(bytes_data: bytes) -> dict:
-    """Converts bytes back to a PyTorch state_dict."""
+    """Converts bytes back to a PyTorch state_dict on CPU."""
     bytes_io = BytesIO(bytes_data)
-    return torch.load(bytes_io)
+    return torch.load(bytes_io, map_location=torch.device("cpu"))
 
 
 def parameters_to_state_dict(parameters: Parameters) -> dict:
@@ -586,8 +586,8 @@ def run_client(args, device):
     client = FlowerClient(task=args.task, args=args, device=device)
 
     fl.client.start_client(
-        server_address=f"0.0.0.0:{args.port}",
-        client=client.to_client(),  # <-- where FlowerClient is of type flwr.client.NumPyClient object
+        server_address=f"127.0.0.1:{args.port}",
+        client=client.to_client(),
         grpc_max_message_length=2147483647,
     )
 
