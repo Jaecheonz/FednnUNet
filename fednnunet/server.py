@@ -341,7 +341,7 @@ if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
     fraction_evaluate = 1.0
 else:
     # nnUNet's default training length
-    num_rounds = 1000
+    num_rounds = 2000
     # Skip federated evaluation to speed up training by one less parameters transfer
     fraction_evaluate = 0.0
 

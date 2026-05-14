@@ -25,13 +25,6 @@ class nnUNetTrainer(nnUNetTrainer):
         )
 
     def run_federated_train_round(self):
-        if self.current_epoch >= self.num_epochs:
-            print(
-                f"Reached max epochs ({self.num_epochs}). Skipping further train rounds.",
-                flush=True,
-            )
-            return
-
         self.on_epoch_start()
 
         self.on_train_epoch_start()
