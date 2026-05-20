@@ -157,6 +157,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
         evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
         inplace: bool = True,
+        aggregation_mode: str = "weighted",
     ) -> None:
         super().__init__(
             fraction_fit=fraction_fit,
@@ -175,6 +176,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
         )
 
         self.task = task
+        self.aggregation_mode = aggregation_mode
+
+        log(INFO, f"Using aggregation_mode={self.aggregation_mode}")
 
     def find_common_layers(self, state_dicts):
         # Find the common keys in all state_dicts
@@ -199,12 +203,36 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         log(INFO, f"Number of compatible keys: {len(compatible_keys)}")
         return compatible_keys
+    
+    def is_norm_key(self, key: str) -> bool:
+        """Return True if a state_dict key belongs to a normalisation layer.
 
+        The current nnU-Net state_dict uses keys such as:
+        encoder.stages.0.0.convs.0.norm.weight
+        encoder.stages.0.0.convs.0.norm.bias
+
+        In weighted_no_norm mode, these keys are excluded from server aggregation
+        so each client keeps its local normalisation parameters.
+        """
+        key_lower = key.lower()
+        return (
+            ".norm." in key_lower
+            or key_lower.endswith(".norm.weight")
+            or key_lower.endswith(".norm.bias")
+            or "batchnorm" in key_lower
+            or "instancenorm" in key_lower
+        )
+        
     def create_compatible_state_dict(self, state_dicts, compatible_keys, weights=None):
-        """Create a weighted average of compatible model parameters.
+        """Create an aggregated state_dict from compatible model parameters.
 
-        This implements sample-weighted FedAvg-style aggregation instead of
-        giving every client equal influence regardless of dataset size.
+        aggregation_mode="weighted":
+            Sample-weighted FedAvg over all compatible floating-point parameters.
+
+        aggregation_mode="weighted_no_norm":
+            FedBN-inspired variant. Normalisation-related parameters are not
+            aggregated by the server, allowing each client to keep local
+            normalisation behaviour.
         """
         new_state_dict = {}
 
@@ -222,7 +250,13 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         normalized_weights = [w / total_weight for w in weights]
 
+        skipped_norm_keys = []
+
         for key in compatible_keys:
+            if self.aggregation_mode == "weighted_no_norm" and self.is_norm_key(key):
+                skipped_norm_keys.append(key)
+                continue
+
             tensors = [s[key].detach().cpu() for s in state_dicts]
 
             # Some state_dict entries can be integer buffers.
@@ -244,6 +278,16 @@ class MyStrategy(fl.server.strategy.FedAvg):
             weight_tensor = weight_tensor.view(*view_shape)
 
             new_state_dict[key] = torch.sum(stacked * weight_tensor, dim=0)
+
+        if skipped_norm_keys:
+            log(
+                INFO,
+                (
+                    f"FedBN-inspired aggregation skipped "
+                    f"{len(skipped_norm_keys)} normalisation parameter(s). "
+                    f"Example skipped keys: {skipped_norm_keys[:5]}"
+                ),
+            )
 
         return new_state_dict
 
@@ -386,6 +430,18 @@ parser.add_argument(
     default=None,
     help="Number of federated training rounds. If not set, defaults to 1 for preprocessing tasks and 2000 for training.",
 )
+parser.add_argument(
+    "--aggregation_mode",
+    type=str,
+    choices=["weighted", "weighted_no_norm"],
+    default="weighted",
+    help=(
+        "Aggregation mode. "
+        "'weighted' uses sample-weighted FedAvg. "
+        "'weighted_no_norm' uses sample-weighted FedAvg but skips normalisation-related parameters "
+        "as a FedBN-inspired local normalisation preservation mode."
+    ),
+)
 
 args = parser.parse_args()
 num_clients = args.num_clients
@@ -401,7 +457,13 @@ else:
 
 num_rounds = args.num_rounds if args.num_rounds is not None else default_num_rounds
 
-log(INFO, f"Starting task={args.task} with num_rounds={num_rounds}")
+log(
+    INFO,
+    (
+        f"Starting task={args.task} with num_rounds={num_rounds} "
+        f"and aggregation_mode={args.aggregation_mode}"
+    ),
+)
 
 strategy = MyStrategy(
     args.task,
@@ -409,6 +471,7 @@ strategy = MyStrategy(
     min_fit_clients=num_clients,
     min_evaluate_clients=num_clients,
     fraction_evaluate=fraction_evaluate,
+    aggregation_mode=args.aggregation_mode,
 )
 
 

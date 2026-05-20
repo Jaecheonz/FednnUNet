@@ -32,6 +32,11 @@ PORT=8080
 SERVER_ADDRESS=127.0.0.1
 NUM_ROUNDS=2000
 
+# Options:
+#   weighted         = corrected sample-weighted FedAvg
+#   weighted_no_norm = FedBN-inspired mode that skips normalisation-related parameters
+AGGREGATION_MODE=weighted_no_norm
+
 echo "Running on $(hostname)"
 echo "Using Python: $ENV_PY"
 echo "PWD=$PWD"
@@ -43,6 +48,7 @@ echo "nnUNet_results=$nnUNet_results"
 echo "PORT=$PORT"
 echo "SERVER_ADDRESS=$SERVER_ADDRESS"
 echo "NUM_ROUNDS=$NUM_ROUNDS"
+echo "AGGREGATION_MODE=$AGGREGATION_MODE"
 
 $ENV_PY --version
 $ENV_PY -c "import sys, torch, flwr, nnunetv2, fednnunet; print('exe', sys.executable); print('torch', torch.__version__); print('flwr', flwr.__version__); print('nnunetv2 ok', nnunetv2.__file__); print('fednnunet ok', getattr(fednnunet, '__file__', 'namespace-package'))"
@@ -59,7 +65,8 @@ echo "=== START FEDERATED TRAINING ==="
 $ENV_PY -u -m fednnunet.run train "301 302" 3d_fullres 0 \
     --port "$PORT" \
     --server_address "$SERVER_ADDRESS" \
-    --num_rounds "$NUM_ROUNDS"
+    --num_rounds "$NUM_ROUNDS" \
+    --aggregation_mode "$AGGREGATION_MODE"
 
 TRAIN_EXIT=$?
 
@@ -77,7 +84,8 @@ $ENV_PY -u -m fednnunet.run train "301 302" 3d_fullres 0 \
     --val_best \
     --port "$PORT" \
     --server_address "$SERVER_ADDRESS" \
-    --num_rounds 1
+    --num_rounds 1 \
+    --aggregation_mode "$AGGREGATION_MODE"
 
 VAL_EXIT=$?
 

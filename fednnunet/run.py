@@ -50,6 +50,17 @@ parser.add_argument(
     help="Number of federated training rounds to pass to the server. If not set, server.py uses its default.",
 )
 parser.add_argument(
+    "--aggregation_mode",
+    type=str,
+    choices=["weighted", "weighted_no_norm"],
+    default="weighted",
+    help=(
+        "Aggregation mode passed to the server. "
+        "'weighted' uses sample-weighted FedAvg. "
+        "'weighted_no_norm' skips normalisation-related parameters as a FedBN-inspired mode."
+    ),
+)
+parser.add_argument(
     "--server_address",
     type=str,
     default="127.0.0.1",
@@ -89,6 +100,7 @@ else:
 configuration = args.configuration
 port = args.port
 num_rounds = args.num_rounds
+aggregation_mode = args.aggregation_mode
 server_address = args.server_address
 
 multi_gpu = True
@@ -124,6 +136,8 @@ for fold in folds:
             str(num_clients),
             "--port",
             str(port),
+            "--aggregation_mode",
+            aggregation_mode,
         ]
 
         if num_rounds is not None:
