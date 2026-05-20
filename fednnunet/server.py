@@ -35,40 +35,44 @@ def parameters_to_state_dict(parameters: Parameters) -> dict:
     return bytes_to_state_dict(bytes_data)
 
 
-def average_dicts(dicts):
-    if not dicts:
+def weighted_average_metrics(results):
+    """Aggregate numeric client metrics using num_examples as weights.
+
+    This avoids giving a small client and a large client the same influence
+    in the reported server-side metrics.
+    """
+    if not results:
         return {}
 
-    # Initialize a dictionary to keep track of the sum and count for each key
     totals = {}
-    counts = {}
+    total_weights = {}
 
-    # Iterate through each dictionary
-    for d in dicts:
-        for key, value in d.items():
-            if key in totals:
-                totals[key] += value
-                counts[key] += 1
-            else:
-                totals[key] = value
-                counts[key] = 1
+    for _, fit_res in results:
+        weight = fit_res.num_examples if fit_res.num_examples is not None else 1
 
-    # Calculate the average for each key
-    averages = {key: totals[key] / counts[key] for key in totals}
+        for key, value in fit_res.metrics.items():
+            # Only aggregate numeric metrics. Skip strings/lists/etc.
+            if isinstance(value, (int, float)):
+                totals[key] = totals.get(key, 0.0) + float(value) * weight
+                total_weights[key] = total_weights.get(key, 0) + weight
 
-    return averages
+    return {
+        key: totals[key] / total_weights[key]
+        for key in totals
+        if total_weights[key] > 0
+    }
 
 
 def weighted_mean(values, weights):
     return sum(value * weight for value, weight in zip(values, weights)) / sum(weights)
 
 
-def max(values, weights):
+def max_value(values, weights):
     values = torch.tensor(values)
     return torch.max(values).item()
 
 
-def min(values, weights):
+def min_value(values, weights):
     values = torch.tensor(values)
     return torch.min(values).item()
 
@@ -84,8 +88,8 @@ def aggregate_fingerprints(parameters: List[Parameters]) -> Parameters:
 
     # Define aggregation functions for each key in the fingerprint
     aggregation_dict = {
-        "max": max,
-        "min": min,
+        "max": max_value,
+        "min": min_value,
         "mean": weighted_mean,
         "median": weighted_mean,
         "std": weighted_mean,
@@ -196,64 +200,77 @@ class MyStrategy(fl.server.strategy.FedAvg):
         log(INFO, f"Number of compatible keys: {len(compatible_keys)}")
         return compatible_keys
 
-    def create_compatible_state_dict(self, state_dicts, compatible_keys):
+    def create_compatible_state_dict(self, state_dicts, compatible_keys, weights=None):
+        """Create a weighted average of compatible model parameters.
+
+        This implements sample-weighted FedAvg-style aggregation instead of
+        giving every client equal influence regardless of dataset size.
+        """
         new_state_dict = {}
+
+        if not state_dicts:
+            return new_state_dict
+
+        if weights is None:
+            weights = [1 for _ in state_dicts]
+
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            log(WARNING, "Total aggregation weight is zero; falling back to equal weights")
+            weights = [1 for _ in state_dicts]
+            total_weight = sum(weights)
+
+        normalized_weights = [w / total_weight for w in weights]
+
         for key in compatible_keys:
-            # Assuming we take the parameters from the first state_dict
-            keys = [s[key] for s in state_dicts]
-            new_state_dict[key] = torch.mean(torch.stack(keys, dim=0), dim=0)
+            tensors = [s[key].detach().cpu() for s in state_dicts]
+
+            # Some state_dict entries can be integer buffers.
+            # These should not be averaged as floating-point parameters.
+            if not torch.is_floating_point(tensors[0]):
+                new_state_dict[key] = tensors[0].clone()
+                continue
+
+            stacked = torch.stack(tensors, dim=0)
+
+            weight_tensor = torch.tensor(
+                normalized_weights,
+                dtype=stacked.dtype,
+                device=stacked.device,
+            )
+
+            # Reshape weights so they broadcast across parameter dimensions.
+            view_shape = [len(normalized_weights)] + [1] * (stacked.dim() - 1)
+            weight_tensor = weight_tensor.view(*view_shape)
+
+            new_state_dict[key] = torch.sum(stacked * weight_tensor, dim=0)
+
         return new_state_dict
 
     def configure_fit(
         self, server_round: int, parameters: Parameters, client_manager: ClientManager
     ) -> List[Tuple[ClientProxy, FitIns]]:
-        """Configure the next round of training."""
+        """Configure the next round of training.
+
+        This avoids extra client.get_parameters calls before every round.
+        The actual aggregation compatibility check is still performed after
+        clients return their trained parameters in aggregate_fit().
+        """
         config = {}
         if self.on_fit_config_fn is not None:
-            # Custom fit config function provided
             config = self.on_fit_config_fn(server_round)
+
         fit_ins = FitIns(parameters, config)
 
-        # Sample clients
         sample_size, min_num_clients = self.num_fit_clients(
             client_manager.num_available()
         )
+
         clients = client_manager.sample(
-            num_clients=sample_size, min_num_clients=min_num_clients
+            num_clients=sample_size,
+            min_num_clients=min_num_clients,
         )
-        if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
-            return [(client, fit_ins) for client in clients]
 
-        parms = [
-            parameters_to_state_dict(
-                client.get_parameters(
-                    ins=fit_ins, timeout=None, group_id=None
-                ).parameters
-            )
-            for client in clients
-        ]
-
-        if not parms:
-            log(WARNING, f"Round {server_round}: no client parameters received in configure_fit")
-            return []
-
-        for idx, sd in enumerate(parms):
-            torch.save(
-                sd,
-                os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), str(idx) + ".arch"
-                ),
-            )
-
-        compatible_keys = self.find_common_layers(parms)
-
-        if not compatible_keys:
-            log(WARNING, f"Round {server_round}: no compatible keys found across clients")
-        else:
-            # Keep this if you still want the compatibility check/merge side effect
-            new_state_dict = self.create_compatible_state_dict(parms, compatible_keys)
-
-        # Return client/config pairs
         return [(client, fit_ins) for client in clients]
 
     def aggregate_fit(
@@ -261,18 +278,28 @@ class MyStrategy(fl.server.strategy.FedAvg):
         rnd: int,
         results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
         failures: List[BaseException],
-    ) -> Tuple[List[float], Dict[str, fl.common.Scalar]]:
-        if failures:
-            fl.common.logger.log(2, f"Round {rnd} had {len(failures)} failures.")
+    ):
+        """Aggregate client training results after each federated round."""
 
-        # Filter out None results due to failures
+        if failures:
+            log(WARNING, f"Round {rnd} had {len(failures)} failure(s).")
+
         successful_results = [result for result in results if result is not None]
 
-        # If there are no successful results, return None or a default value
         if not successful_results:
-            fl.common.logger.log(2, f"Round {rnd} had {len(failures)} failures.")
-            print(f"aggregate_fit round {rnd}: successful={len(successful_results)}, failures={len(failures)}", flush=True)
+            log(WARNING, f"Round {rnd}: no successful client results received.")
             return None, {}
+
+        # Log per-client metrics for heterogeneity analysis.
+        for client, fit_res in successful_results:
+            log(
+                INFO,
+                (
+                    f"Round {rnd} | client={client.cid} | "
+                    f"num_examples={fit_res.num_examples} | "
+                    f"metrics={fit_res.metrics}"
+                ),
+            )
 
         if self.task == "extract_fingerprint" or self.task == "plan_and_preprocess":
             return (
@@ -281,22 +308,36 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 ),
                 {},
             )
-        # Perform aggregation on successful results
-        aggregated_weights = self.aggregate_weights(successful_results)
-        # Aggregate custom metrics if aggregation fn was provided
-        metrics_aggregated = {}
-        if self.fit_metrics_aggregation_fn:
-            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
-            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
-        elif rnd == 1:  # Only log this warning once
-            log(WARNING, "No fit_metrics_aggregation_fn provided")
 
-        return aggregated_weights, average_dicts(
-            [r[1].metrics for r in successful_results]
-        )
+        aggregated_weights = self.aggregate_weights(successful_results)
+
+        if aggregated_weights is None:
+            log(WARNING, f"Round {rnd}: aggregation returned None.")
+            return None, {}
+
+        # Prefer Flower's metric aggregation function if one was provided.
+        if self.fit_metrics_aggregation_fn:
+            fit_metrics = [
+                (fit_res.num_examples, fit_res.metrics)
+                for _, fit_res in successful_results
+            ]
+            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+        else:
+            if rnd == 1:
+                log(WARNING, "No fit_metrics_aggregation_fn provided; using weighted_average_metrics().")
+            metrics_aggregated = weighted_average_metrics(successful_results)
+
+        log(INFO, f"Round {rnd} aggregated metrics: {metrics_aggregated}")
+
+        return aggregated_weights, metrics_aggregated
 
     def aggregate_weights(self, results):
+        """Aggregate client model weights using sample-weighted averaging."""
         dicts = [parameters_to_state_dict(res[1].parameters) for res in results]
+        weights = [
+            res[1].num_examples if res[1].num_examples is not None else 1
+            for res in results
+        ]
 
         if not dicts:
             log(WARNING, "aggregate_weights received no client results")
@@ -308,7 +349,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
             log(WARNING, "aggregate_weights found no compatible keys")
             return None
 
-        new_state_dict = self.create_compatible_state_dict(dicts, compatible_keys)
+        log(INFO, f"Aggregating {len(dicts)} client model(s) with weights={weights}")
+
+        new_state_dict = self.create_compatible_state_dict(
+            dicts,
+            compatible_keys,
+            weights=weights,
+        )
+
         return state_dict_to_parameters(new_state_dict)
 
 
@@ -332,18 +380,28 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, required=True, help="Port number for the server to listen on"
 )
+parser.add_argument(
+    "--num_rounds",
+    type=int,
+    default=None,
+    help="Number of federated training rounds. If not set, defaults to 1 for preprocessing tasks and 2000 for training.",
+)
 
 args = parser.parse_args()
 num_clients = args.num_clients
 
 if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
-    num_rounds = 1
+    default_num_rounds = 1
     fraction_evaluate = 1.0
 else:
     # nnUNet's default training length
-    num_rounds = 2000
+    default_num_rounds = 2000
     # Skip federated evaluation to speed up training by one less parameters transfer
     fraction_evaluate = 0.0
+
+num_rounds = args.num_rounds if args.num_rounds is not None else default_num_rounds
+
+log(INFO, f"Starting task={args.task} with num_rounds={num_rounds}")
 
 strategy = MyStrategy(
     args.task,

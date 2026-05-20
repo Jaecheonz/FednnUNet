@@ -43,10 +43,23 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, required=True, help="Port number for the server to listen on"
 )
+parser.add_argument(
+    "--num_rounds",
+    type=int,
+    default=None,
+    help="Number of federated training rounds to pass to the server. If not set, server.py uses its default.",
+)
+parser.add_argument(
+    "--server_address",
+    type=str,
+    default="127.0.0.1",
+    help="Server address passed to clients. Defaults to 127.0.0.1 for local single-node runs.",
+)
 
 args, unknown = parser.parse_known_args()
 
-datasets = set(args.data_centers)
+# Keep dataset order stable while removing duplicates.
+datasets = list(dict.fromkeys(args.data_centers))
 num_clients = len(datasets)
 task = args.task
 fold = args.fold
@@ -75,6 +88,8 @@ else:
 
 configuration = args.configuration
 port = args.port
+num_rounds = args.num_rounds
+server_address = args.server_address
 
 multi_gpu = True
 
@@ -100,17 +115,24 @@ for fold in folds:
 
         server_log = open(f"server_fold{fold}.log", "w", buffering=1)
 
+        server_command = [
+            sys.executable,
+            "-u",
+            "fednnunet/server.py",
+            task,
+            "-n",
+            str(num_clients),
+            "--port",
+            str(port),
+        ]
+
+        if num_rounds is not None:
+            server_command += ["--num_rounds", str(num_rounds)]
+
+        print(" ".join(server_command))
+
         server_process = subprocess.Popen(
-            [
-                sys.executable,
-                "-u",
-                "fednnunet/server.py",
-                task,
-                "-n",
-                str(num_clients),
-                "--port",
-                str(port),
-            ],
+            server_command,
             env=server_env,
             stdout=server_log,
             stderr=subprocess.STDOUT,
@@ -123,7 +145,7 @@ for fold in folds:
 
             client_env = os.environ.copy()
             if multi_gpu:
-                gpu = node_mapping[client_dataset]
+                gpu = node_mapping.get(client_dataset, len(client_processes))
                 client_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
                 print(
                     f"Running {task} for dataset {client_dataset} with fold {fold} on GPU {gpu}"
@@ -138,6 +160,8 @@ for fold in folds:
                 "fednnunet.client_entrypoints",
                 "--port",
                 str(port),
+                "--server_address",
+                server_address,
                 task,
             ]
 

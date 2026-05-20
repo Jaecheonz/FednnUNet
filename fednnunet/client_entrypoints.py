@@ -14,6 +14,13 @@ def client_entry():
         "--port", type=int, required=True, help="Port number of the server to listen on"
     )
 
+    parser.add_argument(
+        "--server_address",
+        type=str,
+        default="127.0.0.1",
+        help="Server address or hostname. Defaults to 127.0.0.1 for local single-node runs.",
+    )
+
     subparsers = parser.add_subparsers(
         help="Select the nnUNetv2 command to be executed", dest="task"
     )
@@ -257,6 +264,8 @@ def client_entry():
     )
 
     args = parser.parse_args()
+
+    device = torch.device("cpu")
 
     if args.task == "train":
         assert args.device in [

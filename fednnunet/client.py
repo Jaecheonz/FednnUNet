@@ -44,6 +44,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--port", type=int, required=True, help="Port number of the server to listen on"
 )
+parser.add_argument(
+    "--server_address",
+    type=str,
+    default="127.0.0.1",
+    help="Server address or hostname. Defaults to 127.0.0.1 for local single-node runs.",
+)
 
 subparsers = parser.add_subparsers(
     help="Select the nnUNetv2 command to be executed", dest="task"
@@ -304,7 +310,6 @@ if args.task == "train":
     elif args.device == "cuda":
         # multithreading in torch doesn't help nnU-Net if run on GPU
         torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
         device = torch.device("cuda")
     else:
         device = torch.device("mps")
@@ -348,6 +353,8 @@ class FlowerClient(fl.client.Client):
         self.task = task
         self.dataset_name = maybe_convert_to_dataset_name(args.dataset_name_or_id)
         self.dataset_id = convert_dataset_name_to_id(self.dataset_name)
+        self.preprocessed_output_folder = join(nnUNet_preprocessed, self.dataset_name)
+        self.fold = args.fold if hasattr(args, "fold") else 0
         self.num_samples = None
         self.extract_fingerprint = False
         self.plan_experiment = False
@@ -379,7 +386,31 @@ class FlowerClient(fl.client.Client):
                 self.trainer.initialize()
 
             self.model = self.trainer.network
+
+            # on_train_start() sets up the nnU-Net dataloaders, so count cases after it.
             self.trainer.on_train_start()
+
+            split_train_examples, split_val_examples = self.count_cases_from_split_file()
+
+            if split_train_examples is not None and split_val_examples is not None:
+                self.num_train_examples = split_train_examples
+                self.num_val_examples = split_val_examples
+            else:
+                self.num_train_examples = self.count_dataloader_cases(
+                    self.trainer.dataloader_train
+                )
+                self.num_val_examples = self.count_dataloader_cases(
+                    self.trainer.dataloader_val
+                )
+
+            print(
+                (
+                    f"[INIT] dataset={self.dataset_id} | "
+                    f"train_examples={self.num_train_examples} | "
+                    f"val_examples={self.num_val_examples}"
+                ),
+                flush=True,
+            )
 
         if self.task == "plan_and_preprocess":
             self.extract_fingerprint = True
@@ -402,8 +433,6 @@ class FlowerClient(fl.client.Client):
             self.fingerprint = None
             self.local_fingerprint = None
 
-        self.preprocessed_output_folder = join(nnUNet_preprocessed, self.dataset_name)
-
     def get_overlapping_keys(self, state_dict1, state_dict2):
         """Find keys that are present in both state_dicts and have the same shape."""
         overlapping_keys = set(state_dict1.keys()).intersection(state_dict2.keys())
@@ -425,6 +454,57 @@ class FlowerClient(fl.client.Client):
 
         return target_state_dict
 
+    def count_cases_from_split_file(self):
+        """Count train/validation cases from nnU-Net's splits_final.json.
+
+        This is more reliable than inspecting dataloader internals because
+        nnU-Net dataloaders may wrap the actual case dictionary.
+        """
+        split_file = join(self.preprocessed_output_folder, "splits_final.json")
+
+        try:
+            import json
+
+            with open(split_file, "r") as f:
+                splits = json.load(f)
+
+            fold_idx = int(self.fold)
+
+            train_cases = len(splits[fold_idx]["train"])
+            val_cases = len(splits[fold_idx]["val"])
+
+            return train_cases, val_cases
+
+        except Exception as e:
+            print(
+                f"[WARN] Could not count cases from {split_file}: {e}",
+                flush=True,
+            )
+            return None, None
+        
+    def count_dataloader_cases(self, dataloader):
+        """Safely count the number of cases available in an nnU-Net dataloader.
+
+        This is used as num_examples for weighted FedAvg aggregation.
+        Falls back to 1 if the internal data structure cannot be inspected.
+        """
+        try:
+            data = dataloader.generator._data
+
+            if hasattr(data, "keys"):
+                return len(list(data.keys()))
+
+            if hasattr(data, "_data") and hasattr(data._data, "keys"):
+                return len(list(data._data.keys()))
+
+            if hasattr(data, "__len__"):
+                return len(data)
+
+        except Exception as e:
+            print(f"[WARN] Could not count dataloader cases: {e}", flush=True)
+
+        return 1
+    
     def get_fingerprint(self):
         if not self.local_fingerprint:
             # self.local_fingerprint = extract_fingerprint_dataset(self.dataset_id, clean=True)
@@ -459,7 +539,7 @@ class FlowerClient(fl.client.Client):
 
         parm = GetParametersRes(
             parameters=state_dict_to_parameters(parameters),
-            status=Status(code=Code(0), message="caguento"),
+            status=Status(code=Code.OK, message="Parameters returned"),
         )
         return parm
 
@@ -484,7 +564,7 @@ class FlowerClient(fl.client.Client):
         if self.extract_fingerprint:
             return FitRes(
                 parameters=self.get_parameters({}).parameters,
-                status=Status(code=Code(0), message="Fingerprint extracted"),
+                status=Status(code=Code.OK, message="Fingerprint extracted"),
                 num_examples=0,
                 metrics={},
             )
@@ -500,24 +580,36 @@ class FlowerClient(fl.client.Client):
             traceback.print_exc()
             raise
 
-        tl = np.round(
-            self.trainer.logger.my_fantastic_logging["train_losses"][-1], decimals=4
-        )
+        log_data = self.trainer.logger.my_fantastic_logging
 
-        train_data = self.trainer.dataloader_train.generator._data
+        metrics = {}
 
-        if hasattr(train_data, "keys"):
-            num_examples = len(list(train_data.keys()))
-        elif hasattr(train_data, "_data") and hasattr(train_data._data, "keys"):
-            num_examples = len(list(train_data._data.keys()))
-        else:
-            num_examples = 1
+        if len(log_data.get("train_losses", [])) > 0:
+            tl = np.round(log_data["train_losses"][-1], decimals=4)
+            metrics["train_loss"] = float(tl)
+            # Keep "loss" as well because Flower commonly expects this name.
+            metrics["loss"] = float(tl)
+
+        if len(log_data.get("val_losses", [])) > 0:
+            vl = np.round(log_data["val_losses"][-1], decimals=4)
+            metrics["val_loss"] = float(vl)
+
+        if len(log_data.get("dice_per_class_or_region", [])) > 0:
+            dc = [
+                np.round(i, decimals=4)
+                for i in log_data["dice_per_class_or_region"][-1]
+            ]
+            metrics["fg_dice"] = float(np.nanmean(dc))
+
+            for class_idx, dice_value in enumerate(dc, start=1):
+                if not np.isnan(dice_value):
+                    metrics[f"dice_class_{class_idx}"] = float(dice_value)
 
         fr = FitRes(
             parameters=self.get_parameters({}).parameters,
-            status=Status(code=Code(0), message=""),
-            num_examples=num_examples,
-            metrics={"loss": float(tl)},
+            status=Status(code=Code.OK, message="Training round completed"),
+            num_examples=self.num_train_examples,
+            metrics=metrics,
         )
         return fr
 
@@ -554,7 +646,7 @@ class FlowerClient(fl.client.Client):
                     logging.info(f"Dataset {self.dataset_name} preprocessed")
 
             return EvaluateRes(
-                status=Status(code=Code(0), message="Federated fingerprint saved"),
+                status=Status(code=Code.OK, message="Federated fingerprint saved"),
                 loss=0.0,
                 num_examples=1,
                 metrics={},
@@ -571,9 +663,9 @@ class FlowerClient(fl.client.Client):
         ]
 
         er = EvaluateRes(
-            status=Status(code=Code(0), message="yacasi"),
+            status=Status(code=Code.OK, message="Evaluation completed"),
             loss=float(vl),
-            num_examples=len(self.trainer.dataloader_val.generator._data),
+            num_examples=self.num_val_examples,
             metrics={"fg_dice": float(np.nanmean(dc))},
         )
 
@@ -586,7 +678,7 @@ def run_client(args, device):
     client = FlowerClient(task=args.task, args=args, device=device)
 
     fl.client.start_client(
-        server_address=f"127.0.0.1:{args.port}",
+        server_address=f"{args.server_address}:{args.port}",
         client=client.to_client(),
         grpc_max_message_length=2147483647,
     )

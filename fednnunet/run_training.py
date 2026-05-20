@@ -12,6 +12,8 @@ from nnUNet.nnunetv2.run.run_training import (
     maybe_load_checkpoint,
 )
 
+# Force nnU-Net's trainer lookup to resolve to the federated trainer extension.
+# This preserves the normal nnU-Net interface while enabling federated round-based training.
 sys.modules["nnunetv2.training.nnUNetTrainer.nnUNetTrainer"] = nnUNetTrainer
 
 
@@ -42,7 +44,7 @@ def run_training(
                 fold = int(fold)
             except ValueError as e:
                 print(
-                    f'Unable to convert given value for fold to int: {fold}. fold must bei either "all" or an integer!'
+                    f'Unable to convert given value for fold to int: {fold}. fold must be either "all" or an integer!'
                 )
                 raise e
 
@@ -68,7 +70,7 @@ def run_training(
 
         assert not (
             continue_training and only_run_validation
-        ), f"Cannot set --c and --val flag at the same time. Dummy."
+        ), "Cannot set --c and --val at the same time."
 
         maybe_load_checkpoint(
             nnunet_trainer, continue_training, only_run_validation, pretrained_weights
