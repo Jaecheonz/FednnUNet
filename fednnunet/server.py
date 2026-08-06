@@ -1,14 +1,32 @@
+import json
 import os
+import re
 from io import BytesIO
 from logging import INFO, WARNING
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import flwr as fl
 import torch
-from flwr.common import FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
+from flwr.common import (
+    Code,
+    EvaluateIns,
+    FitIns,
+    GetParametersIns,
+    GetPropertiesIns,
+    MetricsAggregationFn,
+    NDArrays,
+    Parameters,
+    Scalar,
+)
 from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
+
+from fednnunet.experiment_utils import (
+    seed_everything,
+    write_json,
+)
 
 
 def state_dict_to_bytes(state_dict) -> bytes:
@@ -158,6 +176,10 @@ class MyStrategy(fl.server.strategy.FedAvg):
         evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
         inplace: bool = True,
         aggregation_mode: str = "weighted",
+        num_rounds: int = 1,
+        run_dir: str = ".",
+        stats_every: int = 10,
+        initial_dataset_id: int = 301,
     ) -> None:
         super().__init__(
             fraction_fit=fraction_fit,
@@ -177,8 +199,145 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         self.task = task
         self.aggregation_mode = aggregation_mode
+        self.num_rounds = int(num_rounds)
+        self.stats_every = max(1, int(stats_every))
+        self.initial_dataset_id = int(initial_dataset_id)
 
-        log(INFO, f"Using aggregation_mode={self.aggregation_mode}")
+        self.run_dir = Path(run_dir).resolve()
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Stores the shared state sent to clients at the beginning
+        # of the current communication round.
+        self.round_start_state = None
+
+        # The compatibility manifest only needs to be written once.
+        self.compatibility_manifest_written = False
+
+        log(
+            INFO,
+            (
+                f"Using aggregation_mode={self.aggregation_mode} | "
+                f"num_rounds={self.num_rounds} | "
+                f"stats_every={self.stats_every} | "
+                f"run_dir={self.run_dir}"
+            ),
+        )
+
+    def initialize_parameters(
+        self,
+        client_manager: ClientManager,
+    ) -> Optional[Parameters]:
+        """Request the initial global state from a named dataset client."""
+        if self.task != "train":
+            return super().initialize_parameters(
+                client_manager
+            )
+
+        clients_available = client_manager.wait_for(
+            num_clients=self.min_available_clients,
+            timeout=600,
+        )
+
+        if not clients_available:
+            raise RuntimeError(
+                "Timed out waiting for all clients before "
+                "initialising global parameters."
+            )
+
+        clients_by_dataset = {}
+
+        for client_id, client_proxy in (
+            client_manager.all().items()
+        ):
+            properties_result = (
+                client_proxy.get_properties(
+                    ins=GetPropertiesIns(config={}),
+                    timeout=60,
+                    group_id=0,
+                )
+            )
+
+            if properties_result.status.code != Code.OK:
+                raise RuntimeError(
+                    "Could not retrieve properties from "
+                    f"Flower client {client_id}: "
+                    f"{properties_result.status.message}"
+                )
+
+            if "dataset_id" not in properties_result.properties:
+                raise RuntimeError(
+                    f"Flower client {client_id} did not provide "
+                    "a dataset_id property."
+                )
+
+            dataset_id = int(
+                properties_result.properties["dataset_id"]
+            )
+
+            if dataset_id in clients_by_dataset:
+                raise RuntimeError(
+                    "Multiple connected clients reported the same "
+                    f"dataset_id={dataset_id}."
+                )
+
+            clients_by_dataset[dataset_id] = (
+                client_id,
+                client_proxy,
+            )
+
+        if self.initial_dataset_id not in clients_by_dataset:
+            raise RuntimeError(
+                "Requested initial dataset was not connected: "
+                f"initial_dataset_id={self.initial_dataset_id}, "
+                f"available={sorted(clients_by_dataset)}"
+            )
+
+        selected_client_id, selected_client = (
+            clients_by_dataset[self.initial_dataset_id]
+        )
+
+        parameters_result = selected_client.get_parameters(
+            ins=GetParametersIns(config={}),
+            timeout=600,
+            group_id=0,
+        )
+
+        if parameters_result.status.code != Code.OK:
+            raise RuntimeError(
+                "Could not retrieve initial parameters from "
+                f"Dataset {self.initial_dataset_id}: "
+                f"{parameters_result.status.message}"
+            )
+
+        write_json(
+            self.run_dir / "initialization_manifest.json",
+            {
+                "initial_dataset_id": int(
+                    self.initial_dataset_id
+                ),
+                "flower_client_id": str(
+                    selected_client_id
+                ),
+                "available_dataset_ids": sorted(
+                    int(dataset_id)
+                    for dataset_id in clients_by_dataset
+                ),
+                "selection_policy": (
+                    "explicit_dataset_id"
+                ),
+            },
+        )
+
+        log(
+            INFO,
+            (
+                "Using deterministic initial parameters from "
+                f"Dataset {self.initial_dataset_id}, "
+                f"Flower client {selected_client_id}"
+            ),
+        )
+
+        return parameters_result.parameters
 
     def find_common_layers(self, state_dicts):
         # Find the common keys in all state_dicts
@@ -201,9 +360,11 @@ class MyStrategy(fl.server.strategy.FedAvg):
             if all(dim == dimensions[0] for dim in dimensions):
                 compatible_keys.append(key)
 
+        compatible_keys = sorted(compatible_keys)
+
         log(INFO, f"Number of compatible keys: {len(compatible_keys)}")
         return compatible_keys
-    
+
     def is_norm_key(self, key: str) -> bool:
         """Return True if a state_dict key belongs to a normalisation layer.
 
@@ -222,7 +383,339 @@ class MyStrategy(fl.server.strategy.FedAvg):
             or "batchnorm" in key_lower
             or "instancenorm" in key_lower
         )
-        
+
+    def should_record_update_stats(self, server_round: int) -> bool:
+        """Return True when scalar update statistics should be saved."""
+        return (
+            server_round <= 10
+            or server_round % self.stats_every == 0
+            or server_round == self.num_rounds
+        )
+
+    @staticmethod
+    def extract_stage_index(key: str, component: str):
+        """Extract an encoder or decoder stage index from a state-dict key."""
+        match = re.search(
+            rf"{component}\.stages\.(\d+)",
+            key.lower(),
+        )
+
+        if match is None:
+            return None
+
+        return int(match.group(1))
+
+    def get_parameter_group(
+        self,
+        key: str,
+        deepest_compatible_encoder_stage,
+    ) -> Optional[str]:
+        """Map a model parameter to an architectural analysis group."""
+        key_lower = key.lower()
+
+        # dynamic-network-architectures can expose aliases containing
+        # all_modules. Excluding these avoids counting a module twice.
+        if ".all_modules." in key_lower:
+            return None
+
+        if self.is_norm_key(key):
+            return "normalisation"
+
+        if (
+            "seg_layers." in key_lower
+            or "segmentation_head" in key_lower
+            or "segmentation_heads" in key_lower
+        ):
+            match = re.search(
+                r"seg_layers\.(\d+)",
+                key_lower,
+            )
+
+            if match is not None:
+                return f"segmentation_head_{match.group(1)}"
+
+            return "segmentation_head"
+
+        if (
+            "decoder.transpconvs." in key_lower
+            or "decoder.upsampling." in key_lower
+            or "decoder.upsample." in key_lower
+        ):
+            match = re.search(
+                r"decoder\.(?:transpconvs|upsampling|upsample)\.(\d+)",
+                key_lower,
+            )
+
+            if match is not None:
+                return f"decoder_upsample_{match.group(1)}"
+
+            return "decoder_upsample"
+
+        encoder_stage = self.extract_stage_index(
+            key,
+            "encoder",
+        )
+
+        if encoder_stage is not None:
+            if (
+                deepest_compatible_encoder_stage is not None
+                and encoder_stage == deepest_compatible_encoder_stage
+            ):
+                return "bottleneck"
+
+            return f"encoder_stage_{encoder_stage}"
+
+        decoder_stage = self.extract_stage_index(
+            key,
+            "decoder",
+        )
+
+        if decoder_stage is not None:
+            return f"decoder_stage_{decoder_stage}"
+
+        return "other"
+
+    def record_update_statistics(
+        self,
+        server_round: int,
+        client_labels,
+        client_state_dicts,
+        compatible_keys,
+    ) -> None:
+        """Record scalar disagreement statistics for two client updates."""
+        if not self.should_record_update_stats(server_round):
+            return
+
+        if self.round_start_state is None:
+            log(
+                WARNING,
+                (
+                    f"Round {server_round}: no round-start state "
+                    "was available for update analysis."
+                ),
+            )
+            return
+
+        if len(client_state_dicts) != 2:
+            log(
+                WARNING,
+                (
+                    "Update-disagreement logging currently expects "
+                    "exactly two clients; received "
+                    f"{len(client_state_dicts)}."
+                ),
+            )
+            return
+
+        encoder_stages = []
+
+        for key in compatible_keys:
+            stage_index = self.extract_stage_index(
+                key,
+                "encoder",
+            )
+
+            if stage_index is not None:
+                encoder_stages.append(stage_index)
+
+        deepest_compatible_encoder_stage = (
+            max(encoder_stages)
+            if encoder_stages
+            else None
+        )
+
+        grouped_statistics = {}
+
+        for key in compatible_keys:
+            group_name = self.get_parameter_group(
+                key,
+                deepest_compatible_encoder_stage,
+            )
+
+            if group_name is None:
+                continue
+
+            if key not in self.round_start_state:
+                continue
+
+            if (
+                key not in client_state_dicts[0]
+                or key not in client_state_dicts[1]
+            ):
+                continue
+
+            round_start_tensor = (
+                self.round_start_state[key]
+                .detach()
+                .cpu()
+            )
+
+            client_0_tensor = (
+                client_state_dicts[0][key]
+                .detach()
+                .cpu()
+            )
+
+            client_1_tensor = (
+                client_state_dicts[1][key]
+                .detach()
+                .cpu()
+            )
+
+            if (
+                round_start_tensor.shape != client_0_tensor.shape
+                or round_start_tensor.shape != client_1_tensor.shape
+            ):
+                continue
+
+            if not torch.is_floating_point(round_start_tensor):
+                continue
+
+            round_start_float = round_start_tensor.float()
+
+            update_0 = (
+                client_0_tensor.float()
+                - round_start_float
+            )
+
+            update_1 = (
+                client_1_tensor.float()
+                - round_start_float
+            )
+
+            if group_name not in grouped_statistics:
+                grouped_statistics[group_name] = {
+                    "parameter_count": 0,
+                    "base_squared_norm": 0.0,
+                    "update_0_squared_norm": 0.0,
+                    "update_1_squared_norm": 0.0,
+                    "update_dot_product": 0.0,
+                    "update_difference_squared_norm": 0.0,
+                }
+
+            group_stats = grouped_statistics[group_name]
+
+            group_stats["parameter_count"] += (
+                round_start_float.numel()
+            )
+
+            group_stats["base_squared_norm"] += float(
+                torch.sum(
+                    round_start_float * round_start_float
+                ).item()
+            )
+
+            group_stats["update_0_squared_norm"] += float(
+                torch.sum(update_0 * update_0).item()
+            )
+
+            group_stats["update_1_squared_norm"] += float(
+                torch.sum(update_1 * update_1).item()
+            )
+
+            group_stats["update_dot_product"] += float(
+                torch.sum(update_0 * update_1).item()
+            )
+
+            update_difference = update_0 - update_1
+
+            group_stats[
+                "update_difference_squared_norm"
+            ] += float(
+                torch.sum(
+                    update_difference * update_difference
+                ).item()
+            )
+
+        stats_path = (
+            self.run_dir / "update_stats.jsonl"
+        )
+
+        with stats_path.open(
+            "a",
+            encoding="utf-8",
+        ) as stats_file:
+            for group_name in sorted(grouped_statistics):
+                group_stats = grouped_statistics[group_name]
+
+                base_norm = (
+                    group_stats["base_squared_norm"] ** 0.5
+                )
+
+                update_0_norm = (
+                    group_stats["update_0_squared_norm"] ** 0.5
+                )
+
+                update_1_norm = (
+                    group_stats["update_1_squared_norm"] ** 0.5
+                )
+
+                cosine_denominator = (
+                    update_0_norm * update_1_norm
+                )
+
+                if cosine_denominator > 0:
+                    cosine_similarity = (
+                        group_stats["update_dot_product"]
+                        / cosine_denominator
+                    )
+                else:
+                    cosine_similarity = None
+
+                record = {
+                    "round": int(server_round),
+                    "group": group_name,
+                    "client_labels": [
+                        int(label)
+                        for label in client_labels
+                    ],
+                    "parameter_count": int(
+                        group_stats["parameter_count"]
+                    ),
+                    "update_norms": {
+                        str(client_labels[0]): float(
+                            update_0_norm
+                        ),
+                        str(client_labels[1]): float(
+                            update_1_norm
+                        ),
+                    },
+                    "relative_update_norms": {
+                        str(client_labels[0]): float(
+                            update_0_norm
+                            / max(base_norm, 1e-12)
+                        ),
+                        str(client_labels[1]): float(
+                            update_1_norm
+                            / max(base_norm, 1e-12)
+                        ),
+                    },
+                    "pairwise_cosine_similarity": (
+                        None
+                        if cosine_similarity is None
+                        else float(cosine_similarity)
+                    ),
+                    "pairwise_l2_distance": float(
+                        group_stats[
+                            "update_difference_squared_norm"
+                        ] ** 0.5
+                    ),
+                }
+
+                stats_file.write(
+                    json.dumps(record)
+                    + "\n"
+                )
+
+        log(
+            INFO,
+            (
+                f"Round {server_round}: wrote "
+                f"{len(grouped_statistics)} update-statistic "
+                f"group(s) to {stats_path}"
+            ),
+        )
+
     def create_compatible_state_dict(self, state_dicts, compatible_keys, weights=None):
         """Create an aggregated state_dict from compatible model parameters.
 
@@ -292,22 +785,48 @@ class MyStrategy(fl.server.strategy.FedAvg):
         return new_state_dict
 
     def configure_fit(
-        self, server_round: int, parameters: Parameters, client_manager: ClientManager
+        self,
+        server_round: int,
+        parameters: Parameters,
+        client_manager: ClientManager,
     ) -> List[Tuple[ClientProxy, FitIns]]:
-        """Configure the next round of training.
-
-        This avoids extra client.get_parameters calls before every round.
-        The actual aggregation compatibility check is still performed after
-        clients return their trained parameters in aggregate_fit().
-        """
+        """Configure one federated local-training round."""
         config = {}
+
         if self.on_fit_config_fn is not None:
-            config = self.on_fit_config_fn(server_round)
+            config.update(
+                self.on_fit_config_fn(server_round)
+            )
 
-        fit_ins = FitIns(parameters, config)
+        config.update(
+            {
+                "server_round": int(server_round),
+                "total_rounds": int(self.num_rounds),
+            }
+        )
 
-        sample_size, min_num_clients = self.num_fit_clients(
-            client_manager.num_available()
+        # Save the exact shared state sent to clients so their
+        # returned updates can be measured relative to it.
+        if self.task == "train":
+            current_state = parameters_to_state_dict(
+                parameters
+            )
+
+            self.round_start_state = {
+                key: value.detach().cpu().clone()
+                for key, value in current_state.items()
+                if torch.is_tensor(value)
+            }
+
+        fit_ins = FitIns(
+            parameters,
+            config,
+        )
+
+        sample_size, min_num_clients = (
+            self.num_fit_clients(
+                client_manager.num_available()
+            )
         )
 
         clients = client_manager.sample(
@@ -315,7 +834,54 @@ class MyStrategy(fl.server.strategy.FedAvg):
             min_num_clients=min_num_clients,
         )
 
-        return [(client, fit_ins) for client in clients]
+        return [
+            (client, fit_ins)
+            for client in clients
+        ]
+
+    def configure_evaluate(
+        self,
+        server_round: int,
+        parameters: Parameters,
+        client_manager: ClientManager,
+    ):
+        """Send evaluation or final synchronisation instructions."""
+        if self.task != "train":
+            return super().configure_evaluate(
+                server_round,
+                parameters,
+                client_manager,
+            )
+
+        if server_round != self.num_rounds:
+            return []
+
+        clients = client_manager.sample(
+            num_clients=self.min_evaluate_clients,
+            min_num_clients=self.min_available_clients,
+        )
+
+        evaluate_ins = EvaluateIns(
+            parameters,
+            {
+                "final_sync": True,
+                "server_round": int(server_round),
+            },
+        )
+
+        log(
+            INFO,
+            (
+                f"Round {server_round}: sending final "
+                "aggregated parameters to "
+                f"{len(clients)} client(s)."
+            ),
+        )
+
+        return [
+            (client, evaluate_ins)
+            for client in clients
+        ]
 
     def aggregate_fit(
         self,
@@ -326,13 +892,35 @@ class MyStrategy(fl.server.strategy.FedAvg):
         """Aggregate client training results after each federated round."""
 
         if failures:
-            log(WARNING, f"Round {rnd} had {len(failures)} failure(s).")
+            raise RuntimeError(
+                f"Round {rnd} had "
+                f"{len(failures)} client failure(s); "
+                "formal G0 runs do not accept "
+                "partial aggregation."
+            )
 
-        successful_results = [result for result in results if result is not None]
+        successful_results = [
+            result
+            for result in results
+            if result is not None
+        ]
 
         if not successful_results:
-            log(WARNING, f"Round {rnd}: no successful client results received.")
-            return None, {}
+            raise RuntimeError(
+                f"Round {rnd}: no successful client "
+                "results were received."
+            )
+
+        if (
+            self.task == "train"
+            and len(successful_results)
+            != self.min_fit_clients
+        ):
+            raise RuntimeError(
+                f"Round {rnd}: expected "
+                f"{self.min_fit_clients} client result(s), "
+                f"but received {len(successful_results)}."
+            )
 
         # Log per-client metrics for heterogeneity analysis.
         for client, fit_res in successful_results:
@@ -353,7 +941,10 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 {},
             )
 
-        aggregated_weights = self.aggregate_weights(successful_results)
+        aggregated_weights = self.aggregate_weights(
+            successful_results,
+            server_round=rnd,
+        )
 
         if aggregated_weights is None:
             log(WARNING, f"Round {rnd}: aggregation returned None.")
@@ -375,33 +966,260 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         return aggregated_weights, metrics_aggregated
 
-    def aggregate_weights(self, results):
-        """Aggregate client model weights using sample-weighted averaging."""
-        dicts = [parameters_to_state_dict(res[1].parameters) for res in results]
-        weights = [
-            res[1].num_examples if res[1].num_examples is not None else 1
-            for res in results
+    def aggregate_weights(
+        self,
+        results,
+        server_round: int,
+    ):
+        """Aggregate model parameters using strict sample weighting."""
+        client_records = []
+
+        for client_proxy, fit_res in results:
+            if (
+                fit_res.num_examples is None
+                or int(fit_res.num_examples) <= 0
+            ):
+                raise RuntimeError(
+                    f"Invalid num_examples="
+                    f"{fit_res.num_examples} "
+                    f"from client {client_proxy.cid}"
+                )
+
+            dataset_id = int(
+                fit_res.metrics.get(
+                    "dataset_id",
+                    -1,
+                )
+            )
+
+            if dataset_id < 0:
+                raise RuntimeError(
+                    "Client result did not include a valid "
+                    f"dataset_id: client={client_proxy.cid}, "
+                    f"metrics={fit_res.metrics}"
+                )
+
+            client_state_dict = parameters_to_state_dict(
+                fit_res.parameters
+            )
+
+            client_records.append(
+                {
+                    "dataset_id": dataset_id,
+                    "num_examples": int(
+                        fit_res.num_examples
+                    ),
+                    "state_dict": client_state_dict,
+                }
+            )
+
+        if not client_records:
+            raise RuntimeError(
+                "aggregate_weights received no client results"
+            )
+
+        # Keep client ordering deterministic regardless of the order
+        # in which Flower returned results.
+        client_records.sort(
+            key=lambda record: record["dataset_id"]
+        )
+
+        client_labels = [
+            record["dataset_id"]
+            for record in client_records
         ]
 
-        if not dicts:
-            log(WARNING, "aggregate_weights received no client results")
-            return None
+        if len(set(client_labels)) != len(client_labels):
+            raise RuntimeError(
+                "Duplicate dataset identifiers were received "
+                f"during aggregation: {client_labels}"
+            )
 
-        compatible_keys = self.find_common_layers(dicts)
+        weights = [
+            record["num_examples"]
+            for record in client_records
+        ]
+
+        state_dicts = [
+            record["state_dict"]
+            for record in client_records
+        ]
+
+        total_weight = sum(weights)
+
+        if total_weight <= 0:
+            raise RuntimeError(
+                "The total aggregation weight must be positive."
+            )
+
+        normalized_weights = [
+            weight / total_weight
+            for weight in weights
+        ]
+
+        compatible_keys = self.find_common_layers(
+            state_dicts
+        )
 
         if not compatible_keys:
-            log(WARNING, "aggregate_weights found no compatible keys")
-            return None
+            raise RuntimeError(
+                "No mutually compatible model parameters "
+                "were found for aggregation."
+            )
 
-        log(INFO, f"Aggregating {len(dicts)} client model(s) with weights={weights}")
+        log(
+            INFO,
+            (
+                f"Round {server_round}: aggregating "
+                f"clients={client_labels} | "
+                f"counts={weights} | "
+                f"normalised_weights="
+                f"{normalized_weights}"
+            ),
+        )
+
+        # Observe the updates before averaging them.
+        self.record_update_statistics(
+            server_round=server_round,
+            client_labels=client_labels,
+            client_state_dicts=state_dicts,
+            compatible_keys=compatible_keys,
+        )
 
         new_state_dict = self.create_compatible_state_dict(
-            dicts,
+            state_dicts,
             compatible_keys,
             weights=weights,
         )
 
-        return state_dict_to_parameters(new_state_dict)
+        aggregated_keys = sorted(
+            new_state_dict.keys()
+        )
+
+        if not self.compatibility_manifest_written:
+            compatible_key_set = set(
+                compatible_keys
+            )
+
+            client_non_compatible_keys = {}
+
+            for label, state_dict in zip(
+                client_labels,
+                state_dicts,
+            ):
+                client_non_compatible_keys[
+                    str(label)
+                ] = sorted(
+                    set(state_dict.keys())
+                    - compatible_key_set
+                )
+
+            policy_excluded_compatible_keys = sorted(
+                compatible_key_set
+                - set(aggregated_keys)
+            )
+
+            write_json(
+                self.run_dir
+                / "compatibility_manifest.json",
+                {
+                    "round_created": int(server_round),
+                    "aggregation_mode": self.aggregation_mode,
+                    "client_labels": [
+                        int(label)
+                        for label in client_labels
+                    ],
+                    "aggregation_counts": [
+                        int(weight)
+                        for weight in weights
+                    ],
+                    "normalized_weights": [
+                        float(weight)
+                        for weight in normalized_weights
+                    ],
+                    "client_state_dict_key_counts": {
+                        str(label): len(state_dict)
+                        for label, state_dict in zip(
+                            client_labels,
+                            state_dicts,
+                        )
+                    },
+                    "compatible_key_count": len(
+                        compatible_keys
+                    ),
+                    "compatible_keys": compatible_keys,
+                    "aggregated_key_count": len(
+                        aggregated_keys
+                    ),
+                    "aggregated_keys": aggregated_keys,
+                    "policy_excluded_compatible_keys": (
+                        policy_excluded_compatible_keys
+                    ),
+                    "client_non_compatible_key_counts": {
+                        label: len(keys)
+                        for label, keys
+                        in client_non_compatible_keys.items()
+                    },
+                    "client_non_compatible_keys": (
+                        client_non_compatible_keys
+                    ),
+                },
+            )
+
+            self.compatibility_manifest_written = True
+
+        checkpoint_payload = {
+            "round": int(server_round),
+            "aggregation_mode": self.aggregation_mode,
+            "client_labels": [
+                int(label)
+                for label in client_labels
+            ],
+            "aggregation_counts": [
+                int(weight)
+                for weight in weights
+            ],
+            "normalized_weights": [
+                float(weight)
+                for weight in normalized_weights
+            ],
+            "compatible_keys": compatible_keys,
+            "aggregated_keys": aggregated_keys,
+            "state_dict": new_state_dict,
+        }
+
+        latest_checkpoint_path = (
+            self.run_dir
+            / "server_shared_latest.pth"
+        )
+
+        torch.save(
+            checkpoint_payload,
+            latest_checkpoint_path,
+        )
+
+        if server_round == self.num_rounds:
+            final_checkpoint_path = (
+                self.run_dir
+                / "server_shared_final.pth"
+            )
+
+            torch.save(
+                checkpoint_payload,
+                final_checkpoint_path,
+            )
+
+            log(
+                INFO,
+                (
+                    "Saved final server shared state to "
+                    f"{final_checkpoint_path}"
+                ),
+            )
+
+        return state_dict_to_parameters(
+            new_state_dict
+        )
 
 
 # Start Flower server with the custom strategy
@@ -438,12 +1256,53 @@ parser.add_argument(
     help=(
         "Aggregation mode. "
         "'weighted' uses sample-weighted FedAvg. "
-        "'weighted_no_norm' uses sample-weighted FedAvg but skips normalisation-related parameters "
-        "as a FedBN-inspired local normalisation preservation mode."
+        "'weighted_no_norm' uses sample-weighted FedAvg but skips "
+        "normalisation-related parameters as a FedBN-inspired mode."
+    ),
+)
+
+parser.add_argument(
+    "--run_dir",
+    type=str,
+    required=True,
+    help=(
+        "Per-fold experiment directory used for server "
+        "checkpoints, manifests and update statistics."
+    ),
+)
+
+parser.add_argument(
+    "--stats_every",
+    type=int,
+    default=10,
+    help=(
+        "Write update-disagreement statistics every N rounds, "
+        "in addition to rounds 1-10 and the final round."
+    ),
+)
+
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=2026,
+    help="Seed used for deterministic server-side behaviour.",
+)
+
+parser.add_argument(
+    "--initial_dataset_id",
+    type=int,
+    default=301,
+    help=(
+        "Dataset client used to supply the initial "
+        "global model parameters."
     ),
 )
 
 args = parser.parse_args()
+seed_everything(
+    int(args.seed),
+    deterministic=True,
+)
 num_clients = args.num_clients
 
 if args.task == "extract_fingerprint" or args.task == "plan_and_preprocess":
@@ -471,7 +1330,12 @@ strategy = MyStrategy(
     min_fit_clients=num_clients,
     min_evaluate_clients=num_clients,
     fraction_evaluate=fraction_evaluate,
+    accept_failures=False,
     aggregation_mode=args.aggregation_mode,
+    num_rounds=num_rounds,
+    run_dir=args.run_dir,
+    stats_every=args.stats_every,
+    initial_dataset_id=args.initial_dataset_id,
 )
 
 

@@ -1,14 +1,24 @@
 import argparse
 import logging
 import os
+import shutil
 import sys
 from io import BytesIO
+from pathlib import Path
 from typing import List, Optional, Tuple, Type, Union
 
 import flwr as fl
 import numpy as np
 import torch
-from flwr.common import Code, EvaluateRes, FitRes, GetParametersRes, Parameters, Status
+from flwr.common import (
+    Code,
+    EvaluateRes,
+    FitRes,
+    GetParametersRes,
+    GetPropertiesRes,
+    Parameters,
+    Status,
+)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 sys.path.append(
@@ -30,6 +40,7 @@ from nnunetv2.utilities.dataset_name_id_conversion import (
 )
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 
+from fednnunet.experiment_utils import seed_everything, write_json
 from fednnunet.run_training import run_training
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -51,8 +62,26 @@ parser.add_argument(
     help="Server address or hostname. Defaults to 127.0.0.1 for local single-node runs.",
 )
 
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=2026,
+    help="Experiment seed used by Python, NumPy and PyTorch.",
+)
+
+parser.add_argument(
+    "--run_dir",
+    type=str,
+    required=True,
+    help=(
+        "Per-fold experiment directory used for client manifests, "
+        "checkpoints and copied validation metrics."
+    ),
+)
+
 subparsers = parser.add_subparsers(
-    help="Select the nnUNetv2 command to be executed", dest="task"
+    help="Select the nnUNetv2 command to be executed",
+    dest="task",
 )
 
 # Arguments for nnUNetv2_train command
@@ -359,11 +388,34 @@ class FlowerClient(fl.client.Client):
         self.extract_fingerprint = False
         self.plan_experiment = False
         self.preprocess_dataset = False
+        self.final_sync_received = False
 
         self.train = False
         if self.task == "train":
             self.train = True
-            # this calls run_training but is not running any training, I did not change the name of the method for compatibility with regular nnUnet.
+
+            # Create this client's experiment directory before constructing
+            # the trainer or model.
+            self.seed = int(args.seed)
+            self.run_dir = Path(args.run_dir).resolve()
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+
+            self.client_run_dir = (
+                self.run_dir / f"client_{self.dataset_id}"
+            )
+            self.client_run_dir.mkdir(parents=True, exist_ok=True)
+
+            # run_training.py also reads this environment variable.
+            os.environ["EXPERIMENT_SEED"] = str(self.seed)
+
+            # Seed before constructing the nnU-Net trainer and network.
+            seed_everything(
+                self.seed,
+                deterministic=True,
+            )
+
+            # This prepares and returns the trainer. It does not start the
+            # full standalone nnU-Net training loop.
             self.trainer = run_training(
                 args.dataset_name_or_id,
                 args.configuration,
@@ -390,26 +442,45 @@ class FlowerClient(fl.client.Client):
             # on_train_start() sets up the nnU-Net dataloaders, so count cases after it.
             self.trainer.on_train_start()
 
-            split_train_examples, split_val_examples = self.count_cases_from_split_file()
+            split_train_examples, split_val_examples = (
+                self.count_cases_from_split_file()
+            )
 
-            if split_train_examples is not None and split_val_examples is not None:
-                self.num_train_examples = split_train_examples
-                self.num_val_examples = split_val_examples
-            else:
-                self.num_train_examples = self.count_dataloader_cases(
-                    self.trainer.dataloader_train
+            if split_train_examples is None or split_val_examples is None:
+                raise RuntimeError(
+                    "Formal federated runs require a readable "
+                    "splits_final.json; refusing to fall back to "
+                    "an inferred or unit aggregation weight."
                 )
-                self.num_val_examples = self.count_dataloader_cases(
-                    self.trainer.dataloader_val
-                )
+
+            self.num_train_examples = int(split_train_examples)
+            self.num_val_examples = int(split_val_examples)
 
             print(
                 (
                     f"[INIT] dataset={self.dataset_id} | "
                     f"train_examples={self.num_train_examples} | "
-                    f"val_examples={self.num_val_examples}"
+                    f"val_examples={self.num_val_examples} | "
+                    f"seed={self.seed}"
                 ),
                 flush=True,
+            )
+
+            write_json(
+                self.client_run_dir / "client_manifest.json",
+                {
+                    "dataset_id": int(self.dataset_id),
+                    "dataset_name": self.dataset_name,
+                    "fold": str(self.fold),
+                    "seed": int(self.seed),
+                    "configuration": args.configuration,
+                    "plans_identifier": args.p,
+                    "num_train_examples": int(self.num_train_examples),
+                    "num_val_examples": int(self.num_val_examples),
+                    "trainer_output_folder": str(self.trainer.output_folder),
+                    "trainer_num_epochs": int(self.trainer.num_epochs),
+                    "state_dict_key_count": len(self.model.state_dict()),
+                },
             )
 
         if self.task == "plan_and_preprocess":
@@ -481,7 +552,7 @@ class FlowerClient(fl.client.Client):
                 flush=True,
             )
             return None, None
-        
+
     def count_dataloader_cases(self, dataloader):
         """Safely count the number of cases available in an nnU-Net dataloader.
 
@@ -504,7 +575,7 @@ class FlowerClient(fl.client.Client):
             print(f"[WARN] Could not count dataloader cases: {e}", flush=True)
 
         return 1
-    
+
     def get_fingerprint(self):
         if not self.local_fingerprint:
             # self.local_fingerprint = extract_fingerprint_dataset(self.dataset_id, clean=True)
@@ -529,6 +600,19 @@ class FlowerClient(fl.client.Client):
             self.fingerprint = self.local_fingerprint
 
         return self.fingerprint
+
+    def get_properties(self, ins):
+        """Expose stable client metadata to the Flower strategy."""
+        return GetPropertiesRes(
+            status=Status(
+                code=Code.OK,
+                message="Client properties returned",
+            ),
+            properties={
+                "dataset_id": int(self.dataset_id),
+                "dataset_name": str(self.dataset_name),
+            },
+        )
 
     def get_parameters(self, fi):
         if self.extract_fingerprint:
@@ -558,6 +642,31 @@ class FlowerClient(fl.client.Client):
             )
             self.model.load_state_dict(onset_subset_keys_dict, strict=True)
 
+    def save_completed_round_checkpoint(
+        self,
+        checkpoint_path: Path,
+    ) -> None:
+        """Save a checkpoint with the correct completed-round metadata."""
+        original_epoch = int(self.trainer.current_epoch)
+
+        if original_epoch <= 0:
+            raise RuntimeError(
+                "Cannot save a completed-round checkpoint before "
+                "at least one training round has completed."
+            )
+
+        # nnU-Net save_checkpoint stores current_epoch + 1.
+        # Temporarily subtract one so the saved epoch equals the
+        # number of rounds that have actually completed.
+        self.trainer.current_epoch = original_epoch - 1
+
+        try:
+            self.trainer.save_checkpoint(
+                str(checkpoint_path)
+            )
+        finally:
+            self.trainer.current_epoch = original_epoch
+
     def fit(self, fi):
         self.set_parameters(fi.parameters)
 
@@ -569,20 +678,87 @@ class FlowerClient(fl.client.Client):
                 metrics={},
             )
 
-        print(f"[FIT] starting fit for dataset {self.dataset_id}", flush=True)
+        server_round = int(
+            fi.config.get("server_round", 0)
+        )
+        total_rounds = int(
+            fi.config.get("total_rounds", 0)
+        )
+
+        # Short runs of 10 rounds or fewer are allowed as technical pilots.
+        # Formal runs must match the nnU-Net trainer's learning-rate schedule.
+        if (
+            server_round == 1
+            and total_rounds > 10
+            and total_rounds != int(self.trainer.num_epochs)
+        ):
+            raise RuntimeError(
+                "Formal run length does not match the nnU-Net "
+                "learning-rate schedule: "
+                f"Flower total_rounds={total_rounds}, "
+                f"trainer.num_epochs={self.trainer.num_epochs}. "
+                "Use a short <=10-round pilot or run the full "
+                "configured trainer schedule."
+            )
+
+        print(
+            (
+                f"[FIT] starting dataset={self.dataset_id} | "
+                f"server_round={server_round}/{total_rounds}"
+            ),
+            flush=True,
+        )
 
         try:
             self.trainer.run_federated_train_round()
-            print(f"[FIT] finished train round for dataset {self.dataset_id}", flush=True)
+
+            print(
+                (
+                    f"[FIT] finished dataset={self.dataset_id} | "
+                    f"server_round={server_round}/{total_rounds}"
+                ),
+                flush=True,
+            )
+
         except Exception as e:
             import traceback
-            print(f"[FIT] exception for dataset {self.dataset_id}: {e}", flush=True)
+
+            print(
+                (
+                    f"[FIT] exception for dataset "
+                    f"{self.dataset_id}: {e}"
+                ),
+                flush=True,
+            )
             traceback.print_exc()
             raise
 
+        # This checkpoint is saved after the final local update but before
+        # that update is aggregated by the server.
+        if total_rounds > 0 and server_round == total_rounds:
+            local_checkpoint_path = (
+                self.client_run_dir
+                / "client_local_after_final_fit.pth"
+            )
+
+            self.save_completed_round_checkpoint(
+                local_checkpoint_path
+            )
+
+            print(
+                (
+                    "[CHECKPOINT] saved final pre-aggregation "
+                    f"local checkpoint to {local_checkpoint_path}"
+                ),
+                flush=True,
+            )
+
         log_data = self.trainer.logger.my_fantastic_logging
 
-        metrics = {}
+        metrics = {
+            "dataset_id": int(self.dataset_id),
+            "server_round": int(server_round),
+        }
 
         if len(log_data.get("train_losses", [])) > 0:
             tl = np.round(log_data["train_losses"][-1], decimals=4)
@@ -614,8 +790,54 @@ class FlowerClient(fl.client.Client):
         return fr
 
     def evaluate(self, ei):
-        # We need to update to the aggregated parameters, otherwise the model will be evaluated on local weights
+        # Apply the server parameters before saving or evaluating.
         self.set_parameters(ei.parameters)
+
+        # The server sends this instruction only after the final
+        # aggregation has completed.
+        if bool(ei.config.get("final_sync", False)):
+            checkpoint_path = (
+                self.client_run_dir
+                / "client_post_aggregation_final.pth"
+            )
+
+            self.save_completed_round_checkpoint(
+                local_checkpoint_path
+            )
+
+            self.final_sync_received = True
+
+            print(
+                (
+                    "[FINAL SYNC] received final aggregated "
+                    f"parameters for dataset {self.dataset_id}"
+                ),
+                flush=True,
+            )
+
+            print(
+                (
+                    "[CHECKPOINT] saved final post-aggregation "
+                    f"checkpoint to {checkpoint_path}"
+                ),
+                flush=True,
+            )
+
+            return EvaluateRes(
+                status=Status(
+                    code=Code.OK,
+                    message=(
+                        "Final aggregated parameters received "
+                        "and checkpoint saved"
+                    ),
+                ),
+                loss=0.0,
+                num_examples=self.num_val_examples,
+                metrics={
+                    "dataset_id": int(self.dataset_id),
+                    "final_sync": 1,
+                },
+            )
 
         if self.extract_fingerprint:
             save_json(
@@ -683,10 +905,58 @@ def run_client(args, device):
         grpc_max_message_length=2147483647,
     )
 
-    # Clean up after federated training and perform local validation
-    if args.task == "train":
+    # After Flower finishes, the model should contain the final
+    # post-aggregation shared parameters received through evaluate().
+    if args.task == "train" and not args.val:
+        if not client.final_sync_received:
+            raise RuntimeError(
+                "Flower training finished without the client "
+                "receiving the final aggregated parameters. "
+                "Refusing to validate a pre-aggregation model."
+            )
+
         client.trainer.on_train_end()
         client.trainer.perform_actual_validation()
+
+        validation_source = (
+            Path(client.trainer.output_folder)
+            / "validation"
+        )
+
+        validation_target = (
+            client.client_run_dir
+            / "final_post_aggregation"
+        )
+
+        if not validation_source.is_dir():
+            raise RuntimeError(
+                "Expected nnU-Net validation directory was not "
+                f"created: {validation_source}"
+            )
+
+        shutil.copytree(
+            validation_source,
+            validation_target,
+            dirs_exist_ok=True,
+        )
+
+        summary_file = (
+            validation_target / "summary.json"
+        )
+
+        if not summary_file.is_file():
+            raise RuntimeError(
+                "Expected final post-aggregation summary was "
+                f"not created: {summary_file}"
+            )
+
+        print(
+            (
+                "[VALIDATION] copied final post-aggregation "
+                f"results to {validation_target}"
+            ),
+            flush=True,
+        )
 
 
 # if __name__ == "__main__":

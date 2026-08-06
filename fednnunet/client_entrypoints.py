@@ -21,6 +21,23 @@ def client_entry():
         help="Server address or hostname. Defaults to 127.0.0.1 for local single-node runs.",
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help="Experiment seed used by Python, NumPy and PyTorch.",
+    )
+
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        required=True,
+        help=(
+            "Per-fold experiment directory used for client manifests, "
+            "checkpoints and copied validation metrics."
+        ),
+    )
+
     subparsers = parser.add_subparsers(
         help="Select the nnUNetv2 command to be executed", dest="task"
     )

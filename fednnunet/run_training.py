@@ -1,12 +1,13 @@
 # Replace vanilla nnUNetTrainer with federated extension
+import os
 import sys
 from typing import Optional, Union
 
 import torch.cuda
 from batchgenerators.utilities.file_and_folder_operations import join
-from torch.backends import cudnn
 
 import fednnunet.fednnUNetTrainer as nnUNetTrainer
+from fednnunet.experiment_utils import seed_everything
 from nnUNet.nnunetv2.run.run_training import (
     get_trainer_from_args,
     maybe_load_checkpoint,
@@ -54,8 +55,34 @@ def run_training(
         ), "--val_best is not compatible with --disable_checkpointing"
 
     if num_gpus > 1:
-        raise NotImplementedError("FednnUNet does not support DDP training yet.")
+        raise NotImplementedError(
+            "FednnUNet does not support DDP training yet."
+        )
     else:
+        # Seed before constructing the trainer and network so that
+        # parameter initialisation and other random setup are reproducible.
+        experiment_seed = int(
+            os.environ.get(
+                "EXPERIMENT_SEED",
+                "2026",
+            )
+        )
+
+        seed_everything(
+            experiment_seed,
+            deterministic=True,
+        )
+
+        print(
+            (
+                "[REPRODUCIBILITY] "
+                f"EXPERIMENT_SEED={experiment_seed} | "
+                "cudnn.deterministic=True | "
+                "cudnn.benchmark=False"
+            ),
+            flush=True,
+        )
+
         nnunet_trainer = get_trainer_from_args(
             dataset_name_or_id=dataset_name_or_id,
             configuration=configuration,
@@ -66,19 +93,20 @@ def run_training(
         )
 
         if disable_checkpointing:
-            nnunet_trainer.disable_checkpointing = disable_checkpointing
+            nnunet_trainer.disable_checkpointing = (
+                disable_checkpointing
+            )
 
         assert not (
             continue_training and only_run_validation
         ), "Cannot set --c and --val at the same time."
 
         maybe_load_checkpoint(
-            nnunet_trainer, continue_training, only_run_validation, pretrained_weights
+            nnunet_trainer,
+            continue_training,
+            only_run_validation,
+            pretrained_weights,
         )
-
-        if torch.cuda.is_available():
-            cudnn.deterministic = False
-            cudnn.benchmark = True
 
         if return_trainer:
             return nnunet_trainer
