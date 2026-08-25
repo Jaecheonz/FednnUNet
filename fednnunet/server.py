@@ -475,6 +475,213 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         return "other"
 
+    def compute_group_coverage(
+        self,
+        client_labels,
+        client_state_dicts,
+        compatible_keys,
+    ):
+        """Measure compatible parameter coverage for each analysis group.
+
+        Q_{i,g} is the fraction of client i's floating-point parameters
+        in functional group g that belong to the mutually compatible
+        parameter subset.
+
+        This is descriptive instrumentation only. It does not affect
+        aggregation or parameter-sharing decisions.
+        """
+
+        encoder_stages = []
+
+        for key in compatible_keys:
+            stage_index = self.extract_stage_index(
+                key,
+                "encoder",
+            )
+
+            if stage_index is not None:
+                encoder_stages.append(stage_index)
+
+        deepest_compatible_encoder_stage = (
+            max(encoder_stages)
+            if encoder_stages
+            else None
+        )
+
+        # ------------------------------------------------------------
+        # Count mutually compatible floating-point parameter elements
+        # in each functional group.
+        #
+        # Use the same grouping logic as update-disagreement logging,
+        # including exclusion of .all_modules. aliases.
+        # ------------------------------------------------------------
+
+        compatible_group_counts = {}
+
+        for key in compatible_keys:
+            group_name = self.get_parameter_group(
+                key,
+                deepest_compatible_encoder_stage,
+            )
+
+            if group_name is None:
+                continue
+
+            tensor = client_state_dicts[0].get(key)
+
+            if tensor is None:
+                continue
+
+            if not torch.is_tensor(tensor):
+                continue
+
+            if not torch.is_floating_point(tensor):
+                continue
+
+            compatible_group_counts[group_name] = (
+                compatible_group_counts.get(
+                    group_name,
+                    0,
+                )
+                + int(tensor.numel())
+            )
+
+        # ------------------------------------------------------------
+        # Count all floating-point parameter elements belonging to each
+        # corresponding group on each client.
+        # ------------------------------------------------------------
+
+        client_total_group_counts = {}
+
+        for label, state_dict in zip(
+            client_labels,
+            client_state_dicts,
+        ):
+            label_key = str(label)
+
+            client_total_group_counts[
+                label_key
+            ] = {}
+
+            for key, tensor in state_dict.items():
+                group_name = self.get_parameter_group(
+                    key,
+                    deepest_compatible_encoder_stage,
+                )
+
+                if group_name is None:
+                    continue
+
+                if not torch.is_tensor(tensor):
+                    continue
+
+                if not torch.is_floating_point(tensor):
+                    continue
+
+                group_counts = (
+                    client_total_group_counts[
+                        label_key
+                    ]
+                )
+
+                group_counts[group_name] = (
+                    group_counts.get(
+                        group_name,
+                        0,
+                    )
+                    + int(tensor.numel())
+                )
+
+        # Include groups that exist on either client even if none of
+        # their parameters are mutually compatible.
+        all_groups = set(
+            compatible_group_counts.keys()
+        )
+
+        for group_counts in (
+            client_total_group_counts.values()
+        ):
+            all_groups.update(
+                group_counts.keys()
+            )
+
+        coverage = {}
+
+        for group_name in sorted(all_groups):
+            compatible_count = int(
+                compatible_group_counts.get(
+                    group_name,
+                    0,
+                )
+            )
+
+            total_counts = {}
+            client_coverages = {}
+
+            for label in client_labels:
+                label_key = str(label)
+
+                total_count = int(
+                    client_total_group_counts[
+                        label_key
+                    ].get(
+                        group_name,
+                        0,
+                    )
+                )
+
+                total_counts[label_key] = (
+                    total_count
+                )
+
+                if total_count > 0:
+                    client_coverages[
+                        label_key
+                    ] = float(
+                        compatible_count
+                        / total_count
+                    )
+                else:
+                    client_coverages[
+                        label_key
+                    ] = None
+
+            defined_coverages = [
+                value
+                for value
+                in client_coverages.values()
+                if value is not None
+            ]
+
+            coverage[group_name] = {
+                "compatible_parameter_count": (
+                    compatible_count
+                ),
+                "client_total_parameter_counts": (
+                    total_counts
+                ),
+                "client_coverage": (
+                    client_coverages
+                ),
+                "minimum_client_coverage": (
+                    None
+                    if not defined_coverages
+                    else float(
+                        min(defined_coverages)
+                    )
+                ),
+                "mean_client_coverage": (
+                    None
+                    if not defined_coverages
+                    else float(
+                        sum(defined_coverages)
+                        / len(defined_coverages)
+                    )
+                ),
+            }
+
+        return coverage
+
     def record_update_statistics(
         self,
         server_round: int,
@@ -1110,6 +1317,14 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 compatible_keys
             )
 
+            group_coverage = (
+                self.compute_group_coverage(
+                    client_labels=client_labels,
+                    client_state_dicts=state_dicts,
+                    compatible_keys=compatible_keys,
+                )
+            )
+
             client_non_compatible_keys = {}
 
             for label, state_dict in zip(
@@ -1171,6 +1386,9 @@ class MyStrategy(fl.server.strategy.FedAvg):
                     },
                     "client_non_compatible_keys": (
                         client_non_compatible_keys
+                    ),
+                    "group_coverage": (
+                        group_coverage
                     ),
                 },
             )
