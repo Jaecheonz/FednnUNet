@@ -802,7 +802,7 @@ class FlowerClient(fl.client.Client):
             )
 
             self.save_completed_round_checkpoint(
-                local_checkpoint_path
+                checkpoint_path
             )
 
             self.final_sync_received = True
@@ -915,6 +915,10 @@ def run_client(args, device):
                 "Refusing to validate a pre-aggregation model."
             )
 
+        # The final post-aggregation federated checkpoint has already been
+        # saved explicitly during final_sync. Disable nnU-Net's redundant
+        # checkpoint_final.pth write while retaining on_train_end cleanup.
+        client.trainer.disable_checkpointing = True
         client.trainer.on_train_end()
         client.trainer.perform_actual_validation()
 

@@ -416,11 +416,23 @@ def read_update_stats(
             cosine_similarity = (
                 math.nan
                 if cosine_raw is None
-                else float(cosine_raw)
+                else float(
+                    np.clip(
+                        float(cosine_raw),
+                        -1.0,
+                        1.0,
+                    )
+                )
             )
 
             pairwise_l2 = float(
                 record["pairwise_l2_distance"]
+            )
+
+            base_norm = (
+                math.nan
+                if record.get("base_norm") is None
+                else float(record["base_norm"])
             )
 
             # ============================================================
@@ -473,14 +485,20 @@ def read_update_stats(
             # Mean relative update magnitude across the two clients.
             # ============================================================
 
-            relative_update_magnitude = float(
-                np.nanmean(
-                    [
-                        relative_a,
-                        relative_b,
-                    ]
-                )
+            relative_values = np.asarray(
+                [
+                    relative_a,
+                    relative_b,
+                ],
+                dtype=float,
             )
+
+            if np.isnan(relative_values).all():
+                relative_update_magnitude = math.nan
+            else:
+                relative_update_magnitude = float(
+                    np.nanmean(relative_values)
+                )
 
             # ------------------------------------------------------------
             # Store one round/group observation
@@ -497,7 +515,7 @@ def read_update_stats(
                     "parameter_count": int(
                         record["parameter_count"]
                     ),
-
+                    "base_norm": base_norm,
                     "client_a": client_a,
                     "client_b": client_b,
 

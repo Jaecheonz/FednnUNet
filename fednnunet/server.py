@@ -680,14 +680,23 @@ class MyStrategy(fl.server.strategy.FedAvg):
                             update_1_norm
                         ),
                     },
+                    "base_norm": float(base_norm),
                     "relative_update_norms": {
-                        str(client_labels[0]): float(
-                            update_0_norm
-                            / max(base_norm, 1e-12)
+                        str(client_labels[0]): (
+                            None
+                            if base_norm <= 1e-12
+                            else float(
+                                update_0_norm
+                                / base_norm
+                            )
                         ),
-                        str(client_labels[1]): float(
-                            update_1_norm
-                            / max(base_norm, 1e-12)
+                        str(client_labels[1]): (
+                            None
+                            if base_norm <= 1e-12
+                            else float(
+                                update_1_norm
+                                / base_norm
+                            )
                         ),
                     },
                     "pairwise_cosine_similarity": (
