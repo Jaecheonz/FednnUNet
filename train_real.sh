@@ -44,20 +44,117 @@ STATS_EVERY=${STATS_EVERY:-10}
 # Dataset 301 will provide the deterministic initial shared state.
 INITIAL_DATASET_ID=${INITIAL_DATASET_ID:-301}
 
-# G0 baseline:
-# All mutually compatible parameters, including affine
-# InstanceNorm parameters, are globally aggregated.
-AGGREGATION_MODE=weighted
+# -------------------------------------------------------------------------
+# Federated sharing / personalisation policy
+# -------------------------------------------------------------------------
 
-# Use a unique directory so that old checkpoints, logs and
-# validation summaries cannot be reused or overwritten.
-RUN_PREFIX="PILOT_G0"
+AGGREGATION_MODE=${AGGREGATION_MODE:-weighted}
 
-if [ "$NUM_ROUNDS" -eq 2000 ]; then
-    RUN_PREFIX="G0"
+# Space-separated functional groups that should remain client-local.
+#
+# Examples:
+#
+#   LOCAL_GROUPS=""
+#       -> G0: all mutually compatible parameters globally shared
+#
+#   LOCAL_GROUPS="encoder_stage_0"
+#       -> E1
+#
+#   LOCAL_GROUPS="encoder_stage_3"
+#       -> E2
+#
+#   LOCAL_GROUPS="decoder_stage_0"
+#       -> D
+#
+#   LOCAL_GROUPS="normalisation"
+#       -> N
+#
+LOCAL_GROUPS=${LOCAL_GROUPS:-}
+
+# Convert the environment string into a proper Bash argument array.
+LOCAL_GROUP_ARGS=()
+
+if [ -n "$LOCAL_GROUPS" ]; then
+    read -r -a LOCAL_GROUP_ARGS <<< "$LOCAL_GROUPS"
 fi
 
-RUN_ID="${RUN_PREFIX}_weighted_global_fold0_seed${EXPERIMENT_SEED}_${NUM_ROUNDS}r_${SLURM_JOB_ID:-local}"
+# Formal training currently supports either:
+#
+#   - short technical pilots of <= 10 rounds
+#   - the complete 2000-round nnU-Net schedule
+#
+if [ "$NUM_ROUNDS" -gt 10 ] && [ "$NUM_ROUNDS" -ne 2000 ]; then
+    echo "Invalid NUM_ROUNDS=$NUM_ROUNDS"
+    echo "Use <=10 rounds for a technical pilot or 2000 for a formal run."
+    exit 1
+fi
+
+if [ "$AGGREGATION_MODE" = "weighted_no_norm" ] \
+    && [ "${#LOCAL_GROUP_ARGS[@]}" -gt 0 ]; then
+
+    echo "Do not combine weighted_no_norm with LOCAL_GROUPS."
+    echo "Use AGGREGATION_MODE=weighted for controlled personalisation."
+    exit 1
+fi
+
+# -------------------------------------------------------------------------
+# Give the controlled policies stable research names.
+# -------------------------------------------------------------------------
+
+if [ "${#LOCAL_GROUP_ARGS[@]}" -eq 0 ]; then
+
+    POLICY_NAME="G0"
+    POLICY_TAG="G0_weighted_global"
+
+elif [ "${#LOCAL_GROUP_ARGS[@]}" -eq 1 ]; then
+
+    case "${LOCAL_GROUP_ARGS[0]}" in
+
+        encoder_stage_0)
+            POLICY_NAME="E1"
+            ;;
+
+        encoder_stage_3)
+            POLICY_NAME="E2"
+            ;;
+
+        decoder_stage_0)
+            POLICY_NAME="D"
+            ;;
+
+        normalisation)
+            POLICY_NAME="N"
+            ;;
+
+        *)
+            POLICY_NAME="PERS"
+            ;;
+
+    esac
+
+    POLICY_TAG="${POLICY_NAME}_${LOCAL_GROUP_ARGS[0]}_local"
+
+else
+
+    POLICY_NAME="PERS"
+
+    LOCAL_GROUP_TAG=$(printf "%s_" "${LOCAL_GROUP_ARGS[@]}")
+    LOCAL_GROUP_TAG=${LOCAL_GROUP_TAG%_}
+
+    POLICY_TAG="${POLICY_NAME}_${LOCAL_GROUP_TAG}_local"
+
+fi
+
+# Short runs are engineering pilots.
+# The complete 2000-round run is the formal experiment.
+
+if [ "$NUM_ROUNDS" -le 10 ]; then
+    RUN_PREFIX="PILOT_${POLICY_TAG}"
+else
+    RUN_PREFIX="$POLICY_TAG"
+fi
+
+RUN_ID="${RUN_PREFIX}_fold0_seed${EXPERIMENT_SEED}_${NUM_ROUNDS}r_${SLURM_JOB_ID:-local}"
 RUN_DIR="$HOME/fednnunet_experiments/$RUN_ID"
 
 mkdir -p "$RUN_DIR"
@@ -84,6 +181,8 @@ echo "EXPERIMENT_SEED=$EXPERIMENT_SEED"
 echo "STATS_EVERY=$STATS_EVERY"
 echo "INITIAL_DATASET_ID=$INITIAL_DATASET_ID"
 echo "AGGREGATION_MODE=$AGGREGATION_MODE"
+echo "POLICY_NAME=$POLICY_NAME"
+echo "LOCAL_GROUPS=${LOCAL_GROUPS:-<none>}"
 echo "RUN_ID=$RUN_ID"
 echo "RUN_DIR=$RUN_DIR"
 
@@ -109,15 +208,45 @@ fi
 
 echo "=== START FEDERATED TRAINING ==="
 
-$ENV_PY -u -m fednnunet.run train "301 302" 3d_fullres 0 \
-    --port "$PORT" \
-    --server_address "$SERVER_ADDRESS" \
-    --num_rounds "$NUM_ROUNDS" \
-    --aggregation_mode "$AGGREGATION_MODE" \
-    --seed "$EXPERIMENT_SEED" \
-    --run_dir "$RUN_DIR" \
-    --stats_every "$STATS_EVERY" \
-    --initial_dataset_id "$INITIAL_DATASET_ID"
+RUN_COMMAND=(
+    "$ENV_PY"
+    -u
+    -m
+    fednnunet.run
+    train
+    "301 302"
+    3d_fullres
+    0
+    --port
+    "$PORT"
+    --server_address
+    "$SERVER_ADDRESS"
+    --num_rounds
+    "$NUM_ROUNDS"
+    --aggregation_mode
+    "$AGGREGATION_MODE"
+    --seed
+    "$EXPERIMENT_SEED"
+    --run_dir
+    "$RUN_DIR"
+    --stats_every
+    "$STATS_EVERY"
+    --initial_dataset_id
+    "$INITIAL_DATASET_ID"
+)
+
+if [ "${#LOCAL_GROUP_ARGS[@]}" -gt 0 ]; then
+    RUN_COMMAND+=(
+        --local_groups
+        "${LOCAL_GROUP_ARGS[@]}"
+    )
+fi
+
+echo "Federated command:"
+printf " %q" "${RUN_COMMAND[@]}"
+echo
+
+"${RUN_COMMAND[@]}"
 
 TRAIN_EXIT=$?
 
@@ -130,6 +259,13 @@ echo "=== FEDERATED TRAINING AND FINAL VALIDATION FINISHED ==="
 echo "Experiment directory: $RUN_DIR"
 
 EXPECTED_SERVER_CHECKPOINT="$RUN_DIR/fold_0/server_shared_final.pth"
+
+EXPECTED_COMPATIBILITY_MANIFEST="$RUN_DIR/fold_0/compatibility_manifest.json"
+EXPECTED_INITIALIZATION_MANIFEST="$RUN_DIR/fold_0/initialization_manifest.json"
+
+EXPECTED_CLIENT301_CHECKPOINT="$RUN_DIR/fold_0/client_301/client_post_aggregation_final.pth"
+EXPECTED_CLIENT302_CHECKPOINT="$RUN_DIR/fold_0/client_302/client_post_aggregation_final.pth"
+
 EXPECTED_CLIENT301_SUMMARY="$RUN_DIR/fold_0/client_301/final_post_aggregation/summary.json"
 EXPECTED_CLIENT302_SUMMARY="$RUN_DIR/fold_0/client_302/final_post_aggregation/summary.json"
 
@@ -138,6 +274,30 @@ MISSING_OUTPUT=0
 if [ ! -f "$EXPECTED_SERVER_CHECKPOINT" ]; then
     echo "Missing expected server checkpoint:"
     echo "  $EXPECTED_SERVER_CHECKPOINT"
+    MISSING_OUTPUT=1
+fi
+
+if [ ! -f "$EXPECTED_COMPATIBILITY_MANIFEST" ]; then
+    echo "Missing expected compatibility manifest:"
+    echo "  $EXPECTED_COMPATIBILITY_MANIFEST"
+    MISSING_OUTPUT=1
+fi
+
+if [ ! -f "$EXPECTED_INITIALIZATION_MANIFEST" ]; then
+    echo "Missing expected initialization manifest:"
+    echo "  $EXPECTED_INITIALIZATION_MANIFEST"
+    MISSING_OUTPUT=1
+fi
+
+if [ ! -f "$EXPECTED_CLIENT301_CHECKPOINT" ]; then
+    echo "Missing expected Dataset 301 final checkpoint:"
+    echo "  $EXPECTED_CLIENT301_CHECKPOINT"
+    MISSING_OUTPUT=1
+fi
+
+if [ ! -f "$EXPECTED_CLIENT302_CHECKPOINT" ]; then
+    echo "Missing expected Dataset 302 final checkpoint:"
+    echo "  $EXPECTED_CLIENT302_CHECKPOINT"
     MISSING_OUTPUT=1
 fi
 
@@ -158,4 +318,4 @@ if [ "$MISSING_OUTPUT" -ne 0 ]; then
     exit 1
 fi
 
-echo "Required G0 outputs were created successfully."
+echo "Required federated experiment outputs were created successfully."

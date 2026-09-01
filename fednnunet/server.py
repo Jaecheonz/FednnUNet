@@ -180,6 +180,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
         run_dir: str = ".",
         stats_every: int = 10,
         initial_dataset_id: int = 301,
+        local_groups: Optional[List[str]] = None,
     ) -> None:
         super().__init__(
             fraction_fit=fraction_fit,
@@ -203,6 +204,42 @@ class MyStrategy(fl.server.strategy.FedAvg):
         self.stats_every = max(1, int(stats_every))
         self.initial_dataset_id = int(initial_dataset_id)
 
+        self.local_groups = sorted(
+            {
+                str(group).strip()
+                for group in (
+                    local_groups or []
+                )
+                if str(group).strip()
+            }
+        )
+
+        if (
+            self.task != "train"
+            and self.local_groups
+        ):
+            raise ValueError(
+                "--local_groups is only valid for "
+                "federated training."
+            )
+
+        if (
+            self.aggregation_mode
+            == "weighted_no_norm"
+            and self.local_groups
+        ):
+            raise ValueError(
+                "Do not combine weighted_no_norm with "
+                "--local_groups. For the formal N "
+                "personalisation experiment, use "
+                "--aggregation_mode weighted "
+                "--local_groups normalisation."
+            )
+
+        # Filled during initialisation when policy-local
+        # compatible keys are identified before round 1.
+        self.initial_policy_local_compatible_keys = None
+
         self.run_dir = Path(run_dir).resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,6 +256,7 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 f"Using aggregation_mode={self.aggregation_mode} | "
                 f"num_rounds={self.num_rounds} | "
                 f"stats_every={self.stats_every} | "
+                f"local_groups={self.local_groups} | "
                 f"run_dir={self.run_dir}"
             ),
         )
@@ -293,24 +331,196 @@ class MyStrategy(fl.server.strategy.FedAvg):
             )
 
         selected_client_id, selected_client = (
-            clients_by_dataset[self.initial_dataset_id]
+            clients_by_dataset[
+                self.initial_dataset_id
+            ]
         )
 
-        parameters_result = selected_client.get_parameters(
-            ins=GetParametersIns(config={}),
-            timeout=600,
-            group_id=0,
-        )
+        policy_local_keys = []
+        canonical_policy_local_keys = []
+        alias_policy_local_keys = []
 
-        if parameters_result.status.code != Code.OK:
-            raise RuntimeError(
-                "Could not retrieve initial parameters from "
-                f"Dataset {self.initial_dataset_id}: "
-                f"{parameters_result.status.message}"
+        # ============================================================
+        # Personalised training:
+        #
+        # To keep selected functional regions local FROM ROUND 1,
+        # obtain each client's native initial model before any global
+        # synchronisation. This lets us determine cross-client
+        # compatibility and remove policy-local compatible keys from
+        # the initial state sent by the server.
+        # ============================================================
+
+        if self.local_groups:
+            initial_states_by_dataset = {}
+
+            for dataset_id in sorted(
+                clients_by_dataset
+            ):
+                (
+                    flower_client_id,
+                    client_proxy,
+                ) = clients_by_dataset[
+                    dataset_id
+                ]
+
+                parameters_result = (
+                    client_proxy.get_parameters(
+                        ins=GetParametersIns(
+                            config={}
+                        ),
+                        timeout=600,
+                        group_id=0,
+                    )
+                )
+
+                if (
+                    parameters_result
+                    .status
+                    .code
+                    != Code.OK
+                ):
+                    raise RuntimeError(
+                        "Could not retrieve native "
+                        "initial parameters from "
+                        f"Dataset {dataset_id}, "
+                        f"Flower client "
+                        f"{flower_client_id}: "
+                        f"{parameters_result.status.message}"
+                    )
+
+                initial_states_by_dataset[
+                    dataset_id
+                ] = parameters_to_state_dict(
+                    parameters_result.parameters
+                )
+
+            initial_state_dicts = [
+                initial_states_by_dataset[
+                    dataset_id
+                ]
+                for dataset_id
+                in sorted(
+                    initial_states_by_dataset
+                )
+            ]
+
+            initial_compatible_keys = (
+                self.find_common_layers(
+                    initial_state_dicts
+                )
             )
 
+            if not initial_compatible_keys:
+                raise RuntimeError(
+                    "No mutually compatible model "
+                    "parameters were found during "
+                    "personalised initialisation."
+                )
+
+            selected_initial_state = (
+                initial_states_by_dataset[
+                    self.initial_dataset_id
+                ]
+            )
+
+            (
+                policy_local_keys,
+                canonical_policy_local_keys,
+                alias_policy_local_keys,
+            ) = (
+                self.get_policy_local_compatible_keys(
+                    initial_compatible_keys,
+                    selected_initial_state,
+                )
+            )
+
+            policy_local_key_set = set(
+                policy_local_keys
+            )
+
+            initial_state_to_send = {
+                key: value
+                for key, value
+                in selected_initial_state.items()
+                if key
+                not in policy_local_key_set
+            }
+
+            initial_parameters = (
+                state_dict_to_parameters(
+                    initial_state_to_send
+                )
+            )
+
+            self.initial_policy_local_compatible_keys = (
+                list(
+                    policy_local_keys
+                )
+            )
+
+            log(
+                INFO,
+                (
+                    "Personalised initialisation: "
+                    f"local_groups={self.local_groups} | "
+                    "excluded compatible keys="
+                    f"{len(policy_local_keys)} | "
+                    "canonical keys="
+                    f"{len(canonical_policy_local_keys)} | "
+                    "alias keys="
+                    f"{len(alias_policy_local_keys)}"
+                ),
+            )
+
+        # ============================================================
+        # Ordinary G0 / non-personalised training:
+        # preserve the existing deterministic initialisation exactly.
+        # ============================================================
+
+        else:
+            parameters_result = (
+                selected_client.get_parameters(
+                    ins=GetParametersIns(
+                        config={}
+                    ),
+                    timeout=600,
+                    group_id=0,
+                )
+            )
+
+            if (
+                parameters_result
+                .status
+                .code
+                != Code.OK
+            ):
+                raise RuntimeError(
+                    "Could not retrieve initial "
+                    "parameters from "
+                    f"Dataset "
+                    f"{self.initial_dataset_id}: "
+                    f"{parameters_result.status.message}"
+                )
+
+            selected_initial_state = (
+                parameters_to_state_dict(
+                    parameters_result.parameters
+                )
+            )
+
+            initial_state_to_send = (
+                selected_initial_state
+            )
+
+            initial_parameters = (
+                parameters_result.parameters
+            )
+
+            self.initial_policy_local_compatible_keys = []
+
         write_json(
-            self.run_dir / "initialization_manifest.json",
+            self.run_dir
+            / "initialization_manifest.json",
             {
                 "initial_dataset_id": int(
                     self.initial_dataset_id
@@ -320,10 +530,56 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 ),
                 "available_dataset_ids": sorted(
                     int(dataset_id)
-                    for dataset_id in clients_by_dataset
+                    for dataset_id
+                    in clients_by_dataset
                 ),
                 "selection_policy": (
                     "explicit_dataset_id"
+                ),
+                "policy_local_groups": list(
+                    self.local_groups
+                ),
+                "policy_local_compatible_key_count": (
+                    len(
+                        policy_local_keys
+                    )
+                ),
+                "policy_local_compatible_keys": (
+                    policy_local_keys
+                ),
+                "policy_local_canonical_key_count": (
+                    len(
+                        canonical_policy_local_keys
+                    )
+                ),
+                "policy_local_canonical_keys": (
+                    canonical_policy_local_keys
+                ),
+                "policy_local_alias_key_count": (
+                    len(
+                        alias_policy_local_keys
+                    )
+                ),
+                "policy_local_alias_keys": (
+                    alias_policy_local_keys
+                ),
+                "selected_initial_state_key_count": (
+                    len(
+                        selected_initial_state
+                    )
+                ),
+                "initial_transmitted_state_key_count": (
+                    len(
+                        initial_state_to_send
+                    )
+                ),
+                "initial_sync_policy": (
+                    (
+                        "selected_client_state_with_"
+                        "policy_local_compatible_keys_removed"
+                    )
+                    if self.local_groups
+                    else "selected_client_state"
                 ),
             },
         )
@@ -331,13 +587,15 @@ class MyStrategy(fl.server.strategy.FedAvg):
         log(
             INFO,
             (
-                "Using deterministic initial parameters from "
-                f"Dataset {self.initial_dataset_id}, "
-                f"Flower client {selected_client_id}"
+                "Using deterministic initial parameters "
+                f"from Dataset "
+                f"{self.initial_dataset_id}, "
+                f"Flower client "
+                f"{selected_client_id}"
             ),
         )
 
-        return parameters_result.parameters
+        return initial_parameters
 
     def find_common_layers(self, state_dicts):
         # Find the common keys in all state_dicts
@@ -474,6 +732,223 @@ class MyStrategy(fl.server.strategy.FedAvg):
             return f"decoder_stage_{decoder_stage}"
 
         return "other"
+
+    def get_deepest_compatible_encoder_stage(
+        self,
+        compatible_keys,
+    ):
+        """Return the deepest mutually compatible encoder stage."""
+        encoder_stages = []
+
+        for key in compatible_keys:
+            stage_index = self.extract_stage_index(
+                key,
+                "encoder",
+            )
+
+            if stage_index is not None:
+                encoder_stages.append(
+                    stage_index
+                )
+
+        if not encoder_stages:
+            return None
+
+        return max(
+            encoder_stages
+        )
+
+    @staticmethod
+    def tensor_storage_signature(
+        tensor,
+    ):
+        """
+        Return an identity-like signature for one tensor view.
+
+        This is used to detect state-dict aliases such as
+        dynamic-network-architectures .all_modules. entries.
+
+        Aliases must also be excluded when their canonical tensor
+        is policy-local; otherwise a supposedly local parameter
+        could be reintroduced through another state-dict key.
+        """
+        if not torch.is_tensor(tensor):
+            return None
+
+        if tensor.numel() == 0:
+            return None
+
+        try:
+            return (
+                int(
+                    tensor
+                    .untyped_storage()
+                    .data_ptr()
+                ),
+                int(
+                    tensor.storage_offset()
+                ),
+                tuple(
+                    tensor.shape
+                ),
+                tuple(
+                    tensor.stride()
+                ),
+                str(
+                    tensor.dtype
+                ),
+            )
+
+        except Exception:
+            return None
+
+    def get_policy_local_compatible_keys(
+        self,
+        compatible_keys,
+        reference_state_dict,
+    ):
+        """
+        Identify mutually compatible keys deliberately kept local.
+
+        Returns:
+
+            all_local_keys
+            canonical_local_keys
+            alias_local_keys
+
+        canonical_local_keys correspond directly to EC-DAPS
+        functional groups.
+
+        alias_local_keys refer to additional state-dict names that
+        share storage with a canonical local tensor. They are excluded
+        as well so aliases cannot accidentally overwrite local state.
+        """
+
+        if not self.local_groups:
+            return (
+                [],
+                [],
+                [],
+            )
+
+        deepest_compatible_encoder_stage = (
+            self.get_deepest_compatible_encoder_stage(
+                compatible_keys
+            )
+        )
+
+        key_groups = {}
+
+        for key in compatible_keys:
+            group_name = self.get_parameter_group(
+                key,
+                deepest_compatible_encoder_stage,
+            )
+
+            if group_name is not None:
+                key_groups[
+                    key
+                ] = group_name
+
+        available_groups = sorted(
+            set(
+                key_groups.values()
+            )
+        )
+
+        missing_groups = sorted(
+            set(
+                self.local_groups
+            )
+            - set(
+                available_groups
+            )
+        )
+
+        if missing_groups:
+            raise RuntimeError(
+                "Requested policy-local functional "
+                "group(s) were not found among the "
+                "mutually compatible model parameters:\n  - "
+                + "\n  - ".join(
+                    missing_groups
+                )
+                + "\nAvailable groups:\n  - "
+                + "\n  - ".join(
+                    available_groups
+                )
+            )
+
+        canonical_local_keys = sorted(
+            key
+            for key, group_name
+            in key_groups.items()
+            if group_name
+            in self.local_groups
+        )
+
+        local_keys = set(
+            canonical_local_keys
+        )
+
+        # ------------------------------------------------------------
+        # Expand canonical keys to state-dict aliases that represent
+        # the same underlying tensor.
+        # ------------------------------------------------------------
+
+        local_signatures = set()
+
+        for key in canonical_local_keys:
+            tensor = reference_state_dict.get(
+                key
+            )
+
+            signature = (
+                self.tensor_storage_signature(
+                    tensor
+                )
+            )
+
+            if signature is not None:
+                local_signatures.add(
+                    signature
+                )
+
+        if local_signatures:
+            for key in compatible_keys:
+                tensor = reference_state_dict.get(
+                    key
+                )
+
+                signature = (
+                    self.tensor_storage_signature(
+                        tensor
+                    )
+                )
+
+                if (
+                    signature is not None
+                    and signature
+                    in local_signatures
+                ):
+                    local_keys.add(
+                        key
+                    )
+
+        alias_local_keys = sorted(
+            local_keys
+            - set(
+                canonical_local_keys
+            )
+        )
+
+        return (
+            sorted(
+                local_keys
+            ),
+            canonical_local_keys,
+            alias_local_keys,
+        )
 
     def compute_group_coverage(
         self,
@@ -932,49 +1407,146 @@ class MyStrategy(fl.server.strategy.FedAvg):
             ),
         )
 
-    def create_compatible_state_dict(self, state_dicts, compatible_keys, weights=None):
-        """Create an aggregated state_dict from compatible model parameters.
+    def create_compatible_state_dict(
+        self,
+        state_dicts,
+        compatible_keys,
+        weights=None,
+    ):
+        """
+        Create the shared server state from mutually compatible
+        model parameters.
 
         aggregation_mode="weighted":
-            Sample-weighted FedAvg over all compatible floating-point parameters.
+            Sample-weighted FedAvg over compatible parameters,
+            except functional groups deliberately listed in
+            self.local_groups.
 
         aggregation_mode="weighted_no_norm":
-            FedBN-inspired variant. Normalisation-related parameters are not
-            aggregated by the server, allowing each client to keep local
-            normalisation behaviour.
+            Legacy FedBN-inspired behaviour that excludes
+            normalisation-related parameters.
+
+        Policy-local keys are OMITTED from the returned server state.
+        Clients therefore retain their own local copies when the
+        partial shared state is merged into their model.
         """
+
         new_state_dict = {}
 
         if not state_dicts:
             return new_state_dict
 
         if weights is None:
-            weights = [1 for _ in state_dicts]
+            weights = [
+                1
+                for _ in state_dicts
+            ]
 
-        total_weight = sum(weights)
+        total_weight = sum(
+            weights
+        )
+
         if total_weight <= 0:
-            log(WARNING, "Total aggregation weight is zero; falling back to equal weights")
-            weights = [1 for _ in state_dicts]
-            total_weight = sum(weights)
+            log(
+                WARNING,
+                (
+                    "Total aggregation weight is zero; "
+                    "falling back to equal weights"
+                ),
+            )
 
-        normalized_weights = [w / total_weight for w in weights]
+            weights = [
+                1
+                for _ in state_dicts
+            ]
+
+            total_weight = sum(
+                weights
+            )
+
+        normalized_weights = [
+            weight / total_weight
+            for weight in weights
+        ]
+
+        (
+            policy_local_keys,
+            _,
+            _,
+        ) = (
+            self.get_policy_local_compatible_keys(
+                compatible_keys,
+                state_dicts[0],
+            )
+            if self.local_groups
+            else (
+                [],
+                [],
+                [],
+            )
+        )
+
+        policy_local_key_set = set(
+            policy_local_keys
+        )
 
         skipped_norm_keys = []
 
         for key in compatible_keys:
-            if self.aggregation_mode == "weighted_no_norm" and self.is_norm_key(key):
-                skipped_norm_keys.append(key)
+
+            # --------------------------------------------------------
+            # EC-DAPS / controlled personalisation:
+            # deliberately keep this compatible region client-local.
+            # --------------------------------------------------------
+
+            if key in policy_local_key_set:
                 continue
 
-            tensors = [s[key].detach().cpu() for s in state_dicts]
+            # --------------------------------------------------------
+            # Preserve the existing legacy weighted_no_norm mode.
+            # Formal N experiments should instead use:
+            #
+            #   weighted + local_groups=["normalisation"]
+            # --------------------------------------------------------
 
-            # Some state_dict entries can be integer buffers.
-            # These should not be averaged as floating-point parameters.
-            if not torch.is_floating_point(tensors[0]):
-                new_state_dict[key] = tensors[0].clone()
+            if (
+                self.aggregation_mode
+                == "weighted_no_norm"
+                and self.is_norm_key(
+                    key
+                )
+            ):
+                skipped_norm_keys.append(
+                    key
+                )
                 continue
 
-            stacked = torch.stack(tensors, dim=0)
+            tensors = [
+                state_dict[
+                    key
+                ]
+                .detach()
+                .cpu()
+                for state_dict
+                in state_dicts
+            ]
+
+            # Integer buffers are shared but not numerically averaged.
+            if not torch.is_floating_point(
+                tensors[0]
+            ):
+                new_state_dict[
+                    key
+                ] = tensors[
+                    0
+                ].clone()
+
+                continue
+
+            stacked = torch.stack(
+                tensors,
+                dim=0,
+            )
 
             weight_tensor = torch.tensor(
                 normalized_weights,
@@ -982,19 +1554,45 @@ class MyStrategy(fl.server.strategy.FedAvg):
                 device=stacked.device,
             )
 
-            # Reshape weights so they broadcast across parameter dimensions.
-            view_shape = [len(normalized_weights)] + [1] * (stacked.dim() - 1)
-            weight_tensor = weight_tensor.view(*view_shape)
+            view_shape = (
+                [
+                    len(
+                        normalized_weights
+                    )
+                ]
+                + [
+                    1
+                ]
+                * (
+                    stacked.dim()
+                    - 1
+                )
+            )
 
-            new_state_dict[key] = torch.sum(stacked * weight_tensor, dim=0)
+            weight_tensor = (
+                weight_tensor.view(
+                    *view_shape
+                )
+            )
+
+            new_state_dict[
+                key
+            ] = torch.sum(
+                stacked
+                * weight_tensor,
+                dim=0,
+            )
 
         if skipped_norm_keys:
             log(
                 INFO,
                 (
-                    f"FedBN-inspired aggregation skipped "
-                    f"{len(skipped_norm_keys)} normalisation parameter(s). "
-                    f"Example skipped keys: {skipped_norm_keys[:5]}"
+                    "FedBN-inspired aggregation "
+                    f"skipped "
+                    f"{len(skipped_norm_keys)} "
+                    "normalisation parameter(s). "
+                    "Example skipped keys: "
+                    f"{skipped_norm_keys[:5]}"
                 ),
             )
 
@@ -1016,8 +1614,18 @@ class MyStrategy(fl.server.strategy.FedAvg):
 
         config.update(
             {
-                "server_round": int(server_round),
-                "total_rounds": int(self.num_rounds),
+                "server_round": int(
+                    server_round
+                ),
+                "total_rounds": int(
+                    self.num_rounds
+                ),
+                "personalisation_enabled": bool(
+                    self.local_groups
+                ),
+                "local_groups_csv": ",".join(
+                    self.local_groups
+                ),
             }
         )
 
@@ -1277,10 +1885,62 @@ class MyStrategy(fl.server.strategy.FedAvg):
             state_dicts
         )
 
-        if not compatible_keys:
-            raise RuntimeError(
-                "No mutually compatible model parameters "
-                "were found for aggregation."
+        (
+            policy_local_keys,
+            canonical_policy_local_keys,
+            alias_policy_local_keys,
+        ) = (
+            self.get_policy_local_compatible_keys(
+                compatible_keys,
+                state_dicts[0],
+            )
+            if self.local_groups
+            else (
+                [],
+                [],
+                [],
+            )
+        )
+
+        if (
+            server_round == 1
+            and self.local_groups
+        ):
+            expected_initial_local_keys = set(
+                self.initial_policy_local_compatible_keys
+                or []
+            )
+
+            observed_round_one_local_keys = set(
+                policy_local_keys
+            )
+
+            if (
+                expected_initial_local_keys
+                != observed_round_one_local_keys
+            ):
+                raise RuntimeError(
+                    "Policy-local compatible keys "
+                    "changed between initialisation "
+                    "and round 1.\n"
+                    "Initial-only keys: "
+                    f"{sorted(expected_initial_local_keys - observed_round_one_local_keys)}\n"
+                    "Round-1-only keys: "
+                    f"{sorted(observed_round_one_local_keys - expected_initial_local_keys)}"
+                )
+
+            log(
+                INFO,
+                (
+                    "Round 1 personalisation policy: "
+                    f"local_groups={self.local_groups} | "
+                    f"excluded compatible keys="
+                    f"{len(policy_local_keys)} | "
+                    f"canonical="
+                    f"{len(canonical_policy_local_keys)} | "
+                    f"aliases="
+                    f"{len(alias_policy_local_keys)}"
+                ),
             )
 
         log(
@@ -1311,6 +1971,46 @@ class MyStrategy(fl.server.strategy.FedAvg):
         aggregated_keys = sorted(
             new_state_dict.keys()
         )
+
+        if (
+            self.aggregation_mode
+            == "weighted"
+        ):
+            expected_aggregated_keys = (
+                set(
+                    compatible_keys
+                )
+                - set(
+                    policy_local_keys
+                )
+            )
+
+            actual_aggregated_keys = set(
+                aggregated_keys
+            )
+
+            if (
+                actual_aggregated_keys
+                != expected_aggregated_keys
+            ):
+                missing_from_server = sorted(
+                    expected_aggregated_keys
+                    - actual_aggregated_keys
+                )
+
+                unexpectedly_shared = sorted(
+                    actual_aggregated_keys
+                    - expected_aggregated_keys
+                )
+
+                raise RuntimeError(
+                    "Shared-parameter policy validation "
+                    "failed.\n"
+                    "Expected-but-missing shared keys: "
+                    f"{missing_from_server}\n"
+                    "Unexpectedly shared keys: "
+                    f"{unexpectedly_shared}"
+                )
 
         if not self.compatibility_manifest_written:
             compatible_key_set = set(
@@ -1379,6 +2079,33 @@ class MyStrategy(fl.server.strategy.FedAvg):
                     "policy_excluded_compatible_keys": (
                         policy_excluded_compatible_keys
                     ),
+                    "policy_local_groups": list(
+                        self.local_groups
+                    ),
+                    "policy_local_compatible_key_count": (
+                        len(
+                            policy_local_keys
+                        )
+                    ),
+                    "policy_local_compatible_keys": (
+                        policy_local_keys
+                    ),
+                    "policy_local_canonical_key_count": (
+                        len(
+                            canonical_policy_local_keys
+                        )
+                    ),
+                    "policy_local_canonical_keys": (
+                        canonical_policy_local_keys
+                    ),
+                    "policy_local_alias_key_count": (
+                        len(
+                            alias_policy_local_keys
+                        )
+                    ),
+                    "policy_local_alias_keys": (
+                        alias_policy_local_keys
+                    ),
                     "client_non_compatible_key_counts": {
                         label: len(keys)
                         for label, keys
@@ -1398,6 +2125,12 @@ class MyStrategy(fl.server.strategy.FedAvg):
         checkpoint_payload = {
             "round": int(server_round),
             "aggregation_mode": self.aggregation_mode,
+            "policy_local_groups": list(
+                self.local_groups
+            ),
+            "policy_local_compatible_keys": (
+                policy_local_keys
+            ),
             "client_labels": [
                 int(label)
                 for label in client_labels
@@ -1487,7 +2220,22 @@ parser.add_argument(
         "normalisation-related parameters as a FedBN-inspired mode."
     ),
 )
-
+parser.add_argument(
+    "--local_groups",
+    type=str,
+    nargs="*",
+    default=[],
+    help=(
+        "Functional parameter group(s) deliberately kept "
+        "client-specific during training. Examples: "
+        "--local_groups encoder_stage_0, "
+        "--local_groups encoder_stage_3, "
+        "--local_groups decoder_stage_0, or "
+        "--local_groups normalisation. "
+        "These groups remain local from the initial "
+        "synchronisation onward."
+    ),
+)
 parser.add_argument(
     "--run_dir",
     type=str,
@@ -1546,8 +2294,10 @@ num_rounds = args.num_rounds if args.num_rounds is not None else default_num_rou
 log(
     INFO,
     (
-        f"Starting task={args.task} with num_rounds={num_rounds} "
-        f"and aggregation_mode={args.aggregation_mode}"
+        f"Starting task={args.task} with "
+        f"num_rounds={num_rounds} | "
+        f"aggregation_mode={args.aggregation_mode} | "
+        f"local_groups={args.local_groups}"
     ),
 )
 
@@ -1563,6 +2313,7 @@ strategy = MyStrategy(
     run_dir=args.run_dir,
     stats_every=args.stats_every,
     initial_dataset_id=args.initial_dataset_id,
+    local_groups=args.local_groups,
 )
 
 

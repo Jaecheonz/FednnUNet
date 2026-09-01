@@ -69,6 +69,29 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--warmup-sampling-step",
+        type=int,
+        default=10,
+        help=(
+            "Spacing in federated rounds used for the canonical "
+            "EC-DAPS warm-up analysis. For example, a value of 10 "
+            "with --warmup-rounds 200 analyses rounds "
+            "10, 20, ..., 200. Default: 10."
+        ),
+    )
+
+    parser.add_argument(
+        "--recent-observations",
+        type=int,
+        default=5,
+        help=(
+            "Number of final uniformly sampled warm-up observations "
+            "used for the recent-conflict persistence summary. "
+            "Default: 5."
+        ),
+    )
+
+    parser.add_argument(
         "--cosine-threshold",
         type=float,
         default=0.0,
@@ -265,6 +288,431 @@ def numeric_dict(
             ) from error
 
     return output
+
+
+def read_group_coverage(
+    compatibility_manifest_path: Path,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Load architectural compatibility coverage Q from the G0
+    compatibility manifest.
+
+    Q_{i,g} is the fraction of client i's floating-point state-dict
+    elements in functional group g that belong to the mutually
+    compatible parameter subset.
+
+    Q is descriptive metadata only. It is not part of the EC-DAPS
+    sharing score at this stage.
+    """
+
+    if not compatibility_manifest_path.is_file():
+        raise FileNotFoundError(
+            "compatibility_manifest.json not found: "
+            f"{compatibility_manifest_path}"
+        )
+
+    manifest = load_json(
+        compatibility_manifest_path
+    )
+
+    if not isinstance(manifest, dict):
+        raise TypeError(
+            "compatibility_manifest.json must contain "
+            "a JSON object."
+        )
+
+    client_labels_raw = manifest.get(
+        "client_labels"
+    )
+
+    if (
+        not isinstance(client_labels_raw, list)
+        or not client_labels_raw
+    ):
+        raise ValueError(
+            "compatibility_manifest.json does not contain "
+            "a valid non-empty client_labels list."
+        )
+
+    client_labels = [
+        str(label)
+        for label in client_labels_raw
+    ]
+
+    coverage_payload = manifest.get(
+        "group_coverage"
+    )
+
+    if not isinstance(
+        coverage_payload,
+        dict,
+    ):
+        raise ValueError(
+            "compatibility_manifest.json does not contain "
+            "a valid group_coverage object."
+        )
+
+    rows: list[dict[str, Any]] = []
+
+    for group, payload in sorted(
+        coverage_payload.items()
+    ):
+        if not isinstance(payload, dict):
+            raise TypeError(
+                f"group_coverage[{group!r}] must be "
+                "a JSON object."
+            )
+
+        compatible = int(
+            payload[
+                "compatible_parameter_count"
+            ]
+        )
+
+        if compatible < 0:
+            raise ValueError(
+                f"{group}: compatible_parameter_count "
+                "cannot be negative."
+            )
+
+        totals = payload[
+            "client_total_parameter_counts"
+        ]
+
+        coverages = payload[
+            "client_coverage"
+        ]
+
+        if not isinstance(totals, dict):
+            raise TypeError(
+                f"{group}: "
+                "client_total_parameter_counts "
+                "must be an object."
+            )
+
+        if not isinstance(coverages, dict):
+            raise TypeError(
+                f"{group}: client_coverage "
+                "must be an object."
+            )
+
+        row: dict[str, Any] = {
+            "group": str(group),
+            "compatible_parameter_count": (
+                compatible
+            ),
+        }
+
+        calculated_q_values: list[float] = []
+
+        for client_label in client_labels:
+            if client_label not in totals:
+                raise ValueError(
+                    f"{group}: missing total parameter "
+                    f"count for client {client_label}."
+                )
+
+            if client_label not in coverages:
+                raise ValueError(
+                    f"{group}: missing Q value for "
+                    f"client {client_label}."
+                )
+
+            total = int(
+                totals[
+                    client_label
+                ]
+            )
+
+            if total < 0:
+                raise ValueError(
+                    f"{group}: total parameter count "
+                    f"for client {client_label} "
+                    "cannot be negative."
+                )
+
+            q_raw = coverages[
+                client_label
+            ]
+
+            row[
+                f"total_parameter_count_{client_label}"
+            ] = total
+
+            if total == 0:
+                if compatible != 0:
+                    raise ValueError(
+                        f"{group}: client {client_label} "
+                        "has zero total parameters but "
+                        f"{compatible} compatible parameters."
+                    )
+
+                if q_raw is not None:
+                    raise ValueError(
+                        f"{group}: client {client_label} "
+                        "has zero total parameters, so Q "
+                        "must be null."
+                    )
+
+                row[
+                    f"Q_{client_label}"
+                ] = math.nan
+
+                continue
+
+            if compatible > total:
+                raise ValueError(
+                    f"{group}: compatible parameter "
+                    f"count {compatible} exceeds client "
+                    f"{client_label} total {total}."
+                )
+
+            if q_raw is None:
+                raise ValueError(
+                    f"{group}: client {client_label} "
+                    "has parameters but Q is null."
+                )
+
+            q = float(
+                q_raw
+            )
+
+            if not (
+                0.0
+                <= q
+                <= 1.0
+            ):
+                raise ValueError(
+                    f"{group}: Q for client "
+                    f"{client_label} is outside [0, 1]: "
+                    f"{q}"
+                )
+
+            expected_q = (
+                compatible
+                / total
+            )
+
+            if not np.isclose(
+                q,
+                expected_q,
+                rtol=1e-9,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    f"{group}: Q mismatch for client "
+                    f"{client_label}. "
+                    f"Manifest={q}, "
+                    f"expected={expected_q}."
+                )
+
+            row[
+                f"Q_{client_label}"
+            ] = q
+
+            calculated_q_values.append(
+                q
+            )
+
+        if not calculated_q_values:
+            raise ValueError(
+                f"{group}: no defined client coverage "
+                "values were available."
+            )
+
+        calculated_q_min = float(
+            min(
+                calculated_q_values
+            )
+        )
+
+        calculated_q_mean = float(
+            np.mean(
+                calculated_q_values
+            )
+        )
+
+        stored_q_min = payload.get(
+            "minimum_client_coverage"
+        )
+
+        stored_q_mean = payload.get(
+            "mean_client_coverage"
+        )
+
+        if stored_q_min is None:
+            raise ValueError(
+                f"{group}: "
+                "minimum_client_coverage is missing."
+            )
+
+        if stored_q_mean is None:
+            raise ValueError(
+                f"{group}: "
+                "mean_client_coverage is missing."
+            )
+
+        if not np.isclose(
+            float(stored_q_min),
+            calculated_q_min,
+            rtol=1e-9,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"{group}: Q_min mismatch. "
+                f"Manifest={stored_q_min}, "
+                f"expected={calculated_q_min}."
+            )
+
+        if not np.isclose(
+            float(stored_q_mean),
+            calculated_q_mean,
+            rtol=1e-9,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"{group}: Q_mean mismatch. "
+                f"Manifest={stored_q_mean}, "
+                f"expected={calculated_q_mean}."
+            )
+
+        row[
+            "Q_min"
+        ] = calculated_q_min
+
+        row[
+            "Q_mean"
+        ] = calculated_q_mean
+
+        rows.append(
+            row
+        )
+
+    dataframe = pd.DataFrame(
+        rows
+    )
+
+    if dataframe.empty:
+        raise ValueError(
+            "group_coverage contains no groups."
+        )
+
+    if dataframe[
+        "group"
+    ].duplicated().any():
+        raise ValueError(
+            "Duplicate groups were found in "
+            "group_coverage."
+        )
+
+    return (
+        dataframe,
+        client_labels,
+    )
+
+
+def merge_group_coverage(
+    group_summary: pd.DataFrame,
+    group_coverage: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Attach Q coverage metadata to the groups for which C, L, R and P
+    were measured.
+
+    The compatible parameter count used for Q must exactly equal the
+    parameter count used by disagreement logging. A mismatch indicates
+    that Q and C/L/R/P describe different parameter subsets and is
+    therefore treated as a fatal analysis error.
+    """
+
+    summary_groups = set(
+        group_summary[
+            "group"
+        ].astype(str)
+    )
+
+    coverage_groups = set(
+        group_coverage[
+            "group"
+        ].astype(str)
+    )
+
+    missing_groups = sorted(
+        summary_groups
+        - coverage_groups
+    )
+
+    if missing_groups:
+        raise ValueError(
+            "Disagreement groups are missing Q coverage "
+            "metadata:\n  - "
+            + "\n  - ".join(
+                missing_groups
+            )
+        )
+
+    merged = group_summary.merge(
+        group_coverage,
+        on="group",
+        how="left",
+        validate="one_to_one",
+    )
+
+    count_mismatch = (
+        merged[
+            "parameter_count"
+        ].astype(int)
+        != merged[
+            "compatible_parameter_count"
+        ].astype(int)
+    )
+
+    if count_mismatch.any():
+        mismatches = merged.loc[
+            count_mismatch,
+            [
+                "group",
+                "parameter_count",
+                "compatible_parameter_count",
+            ],
+        ]
+
+        raise ValueError(
+            "Q coverage and disagreement statistics "
+            "refer to different parameter counts:\n"
+            f"{mismatches.to_string(index=False)}"
+        )
+
+    prefix_columns = [
+        "group",
+        "observations",
+        "first_logged_round",
+        "last_logged_round",
+        "parameter_count",
+    ]
+
+    coverage_columns = [
+        column
+        for column in group_coverage.columns
+        if column != "group"
+    ]
+
+    remaining_columns = [
+        column
+        for column in merged.columns
+        if (
+            column
+            not in prefix_columns
+            and column
+            not in coverage_columns
+        )
+    ]
+
+    return merged[
+        prefix_columns
+        + coverage_columns
+        + remaining_columns
+    ]
 
 
 def read_update_stats(
@@ -733,6 +1181,139 @@ def longest_true_streak(
     return longest
 
 
+def select_uniform_warmup_observations(
+    dataframe: pd.DataFrame,
+    warmup_rounds: int,
+    sampling_step: int,
+    label_column: str = "group",
+) -> pd.DataFrame:
+    """
+    Select evenly spaced observations for the canonical EC-DAPS
+    warm-up analysis.
+
+    Example:
+
+        warmup_rounds = 200
+        sampling_step = 10
+
+    selects:
+
+        10, 20, 30, ..., 200
+
+    This prevents densely logged early rounds from receiving greater
+    weight simply because they were recorded more frequently.
+    """
+
+    if warmup_rounds <= 0:
+        raise ValueError(
+            "warmup_rounds must be positive."
+        )
+
+    if sampling_step <= 0:
+        raise ValueError(
+            "--warmup-sampling-step must be positive."
+        )
+
+    if label_column not in dataframe.columns:
+        raise ValueError(
+            f"Uniform warm-up selection requires column "
+            f"{label_column!r}."
+        )
+
+    target_rounds = list(
+        range(
+            sampling_step,
+            warmup_rounds + 1,
+            sampling_step,
+        )
+    )
+
+    if not target_rounds:
+        raise ValueError(
+            "No uniform warm-up rounds were produced. "
+            "Check --warmup-rounds and "
+            "--warmup-sampling-step."
+        )
+
+    available_rounds = set(
+        dataframe[
+            "round"
+        ].astype(int)
+    )
+
+    missing_global_rounds = [
+        round_number
+        for round_number in target_rounds
+        if round_number not in available_rounds
+    ]
+
+    if missing_global_rounds:
+        raise ValueError(
+            "The requested uniform warm-up grid contains "
+            "rounds that were not logged:\n  "
+            + ", ".join(
+                str(round_number)
+                for round_number in missing_global_rounds
+            )
+        )
+
+    selected = dataframe.loc[
+        dataframe[
+            "round"
+        ].isin(
+            target_rounds
+        )
+    ].copy()
+
+    if selected.empty:
+        raise ValueError(
+            "No observations matched the requested "
+            "uniform warm-up grid."
+        )
+
+    # Every analysed functional group/region must contain every
+    # target checkpoint. Otherwise comparisons between groups would
+    # again be based on different observation schedules.
+
+    for label, subset in selected.groupby(
+        label_column,
+        sort=True,
+    ):
+        observed = set(
+            subset[
+                "round"
+            ].astype(int)
+        )
+
+        missing = [
+            round_number
+            for round_number in target_rounds
+            if round_number not in observed
+        ]
+
+        if missing:
+            raise ValueError(
+                f"{label_column} {label!r} is missing "
+                "uniform warm-up round(s): "
+                + ", ".join(
+                    str(round_number)
+                    for round_number in missing
+                )
+            )
+
+    selected = selected.sort_values(
+        [
+            label_column,
+            "round",
+        ],
+        kind="stable",
+    ).reset_index(
+        drop=True
+    )
+
+    return selected
+
+
 # ============================================================================
 # Statistical summaries
 # ============================================================================
@@ -772,6 +1353,7 @@ def summarise_features(
     dataframe: pd.DataFrame,
     warmup_rounds: int,
     label_column: str = "group",
+    recent_observations: int = 5,
 ) -> pd.DataFrame:
     """
     Summarise C, L, R and candidate persistence P over the
@@ -787,6 +1369,11 @@ def summarise_features(
         raise ValueError(
             "No logged observations were found at or before "
             f"round {warmup_rounds}."
+        )
+
+    if recent_observations <= 0:
+        raise ValueError(
+            "--recent-observations must be positive."
         )
 
     rows: list[dict[str, Any]] = []
@@ -810,6 +1397,49 @@ def summarise_features(
             )
             if not cumulative_valid.empty
             else math.nan
+        )
+
+        conflict_valid = subset[
+            [
+                "round",
+                "directional_conflict",
+            ]
+        ].dropna(
+            subset=[
+                "directional_conflict"
+            ]
+        )
+
+        recent_conflict = (
+            conflict_valid[
+                "directional_conflict"
+            ]
+            .tail(
+                recent_observations
+            )
+        )
+
+        recent_conflict_fraction = (
+            float(
+                recent_conflict.mean()
+            )
+            if not recent_conflict.empty
+            else math.nan
+        )
+
+        conflict_rounds = ",".join(
+            str(
+                int(
+                    round_number
+                )
+            )
+            for round_number in conflict_valid.loc[
+                conflict_valid[
+                    "directional_conflict"
+                ]
+                >= 0.5,
+                "round",
+            ]
         )
 
         rows.append(
@@ -921,6 +1551,23 @@ def summarise_features(
                     final_persistence
                 ),
 
+                "P_recent_conflict_fraction": (
+                    recent_conflict_fraction
+                ),
+
+                "P_recent_observations": int(
+                    min(
+                        recent_observations,
+                        len(
+                            conflict_valid
+                        ),
+                    )
+                ),
+
+                "P_conflict_rounds": (
+                    conflict_rounds
+                ),
+
                 # ----------------------------------------------------
                 # Raw reference measurements
                 # ----------------------------------------------------
@@ -940,19 +1587,29 @@ def summarise_features(
 
 def feature_correlation_table(
     dataframe: pd.DataFrame,
+    persistence_column: str = (
+        "rolling_conflict_persistence"
+    ),
 ) -> pd.DataFrame:
     """
     Examine redundancy between candidate disagreement measurements.
 
     Spearman correlation is used because relationships do not need
     to be linear.
+
+    For the full logged trajectory, rolling conflict persistence can
+    be used descriptively.
+
+    For the canonical uniformly sampled warm-up, directional_conflict
+    can be supplied so that persistence-related evidence is not
+    distorted by unequal logging density.
     """
 
     columns = [
         "directional_disagreement",
         "update_distance_disagreement",
         "relative_update_magnitude",
-        "rolling_conflict_persistence",
+        persistence_column,
     ]
 
     available = [
@@ -1987,6 +2644,30 @@ def main() -> None:
         update_stats_path
     )
 
+    compatibility_manifest_path = (
+        update_stats_path.parent
+        / "compatibility_manifest.json"
+    )
+
+    print()
+    print(
+        "Reading compatibility coverage:"
+        f"\n  {compatibility_manifest_path}"
+    )
+
+    (
+        group_coverage,
+        coverage_client_labels,
+    ) = read_group_coverage(
+        compatibility_manifest_path
+    )
+
+    group_coverage.to_csv(
+        output_dir
+        / "g0_group_coverage.csv",
+        index=False,
+    )
+
     # ====================================================================
     # 2. Derive candidate persistence P
     # ====================================================================
@@ -2009,15 +2690,100 @@ def main() -> None:
 
     # ====================================================================
     # 3. Summarise candidate C, L, R, P features
+    #
+    # Preserve an all-logged warm-up summary for descriptive reference,
+    # but use an evenly spaced round grid as the canonical EC-DAPS
+    # calibration summary.
     # ====================================================================
 
-    group_summary = summarise_features(
+    all_logged_group_summary = summarise_features(
         round_level,
         warmup_rounds=(
             args.warmup_rounds
         ),
         label_column="group",
+        recent_observations=(
+            args.recent_observations
+        ),
     )
+
+    all_logged_group_summary = (
+        merge_group_coverage(
+            all_logged_group_summary,
+            group_coverage,
+        )
+    )
+
+    all_logged_group_summary.to_csv(
+        output_dir
+        / "g0_group_feature_summary_all_logged.csv",
+        index=False,
+    )
+
+    # --------------------------------------------------------------------
+    # Canonical uniformly sampled EC-DAPS warm-up.
+    #
+    # For the current formal experiment:
+    #
+    #     warmup_rounds = 200
+    #     sampling_step = 10
+    #
+    # gives:
+    #
+    #     10, 20, ..., 200
+    #
+    # Persistence is recomputed after sampling so that cumulative and
+    # rolling quantities refer to the uniform observation grid rather
+    # than the original mixed-density logging schedule.
+    # --------------------------------------------------------------------
+
+    uniform_warmup = (
+        select_uniform_warmup_observations(
+            round_level,
+            warmup_rounds=(
+                args.warmup_rounds
+            ),
+            sampling_step=(
+                args.warmup_sampling_step
+            ),
+            label_column="group",
+        )
+    )
+
+    uniform_warmup = add_persistence_features(
+        uniform_warmup,
+        cosine_threshold=(
+            args.cosine_threshold
+        ),
+        rolling_window=(
+            args.rolling_window
+        ),
+    )
+
+    uniform_warmup.to_csv(
+        output_dir
+        / "g0_uniform_warmup_features.csv",
+        index=False,
+    )
+
+    group_summary = summarise_features(
+        uniform_warmup,
+        warmup_rounds=(
+            args.warmup_rounds
+        ),
+        label_column="group",
+        recent_observations=(
+            args.recent_observations
+        ),
+    )
+
+    group_summary = merge_group_coverage(
+        group_summary,
+        group_coverage,
+    )
+
+    # This is now the CANONICAL group feature summary used for
+    # subsequent EC-DAPS calibration.
 
     group_summary.to_csv(
         output_dir
@@ -2025,9 +2791,20 @@ def main() -> None:
         index=False,
     )
 
+    # Explicitly named copy for clarity when archiving results.
+
+    group_summary.to_csv(
+        output_dir
+        / "g0_group_feature_summary_uniform.csv",
+        index=False,
+    )
+
     # ====================================================================
     # 4. Check possible redundancy between features
     # ====================================================================
+
+    # Full-training/mixed-density correlation remains available as a
+    # descriptive trajectory-level result.
 
     correlation = feature_correlation_table(
         round_level
@@ -2036,6 +2813,61 @@ def main() -> None:
     correlation.to_csv(
         output_dir
         / "g0_round_level_feature_spearman.csv"
+    )
+
+    # Calibration-relevant correlation is calculated only from the
+    # uniformly sampled warm-up observations.
+
+    uniform_correlation = (
+        feature_correlation_table(
+            uniform_warmup,
+            persistence_column=(
+                "directional_conflict"
+            ),
+        )
+    )
+
+    uniform_correlation.to_csv(
+        output_dir
+        / "g0_uniform_feature_spearman.csv"
+    )
+
+    print()
+    print(
+        f"Loaded Q coverage for "
+        f"{len(group_coverage)} "
+        "architectural groups."
+    )
+
+    print(
+        "Coverage clients: "
+        + ", ".join(
+            coverage_client_labels
+        )
+    )
+
+    print(
+        "Groups with disagreement statistics: "
+        f"{len(group_summary)}"
+    )
+
+    q_only_groups = sorted(
+        set(
+            group_coverage[
+                "group"
+            ]
+        )
+        - set(
+            group_summary[
+                "group"
+            ]
+        )
+    )
+
+    print(
+        "Architectural groups without mutually "
+        "measurable disagreement: "
+        f"{len(q_only_groups)}"
     )
 
     print()
@@ -2052,6 +2884,30 @@ def main() -> None:
     print(
         f"Logged groups: "
         f"{round_level['group'].nunique()}"
+    )
+
+    print()
+
+    print(
+        "Canonical EC-DAPS warm-up observations: "
+        f"{len(uniform_warmup)}"
+    )
+
+    print(
+        "Canonical EC-DAPS warm-up rounds: "
+        f"{uniform_warmup['round'].nunique()}"
+    )
+
+    print(
+        "Uniform sampling step: "
+        f"{args.warmup_sampling_step} rounds"
+    )
+
+    print(
+        "Uniform round range: "
+        f"{int(uniform_warmup['round'].min())}"
+        " to "
+        f"{int(uniform_warmup['round'].max())}"
     )
 
     print()
@@ -2102,12 +2958,46 @@ def main() -> None:
             index=False,
         )
 
+        region_uniform_warmup = (
+            select_uniform_warmup_observations(
+                region_round_level,
+                warmup_rounds=(
+                    args.warmup_rounds
+                ),
+                sampling_step=(
+                    args.warmup_sampling_step
+                ),
+                label_column="region",
+            )
+        )
+
+        region_uniform_warmup = (
+            add_persistence_features(
+                region_uniform_warmup,
+                cosine_threshold=(
+                    args.cosine_threshold
+                ),
+                rolling_window=(
+                    args.rolling_window
+                ),
+            )
+        )
+
+        region_uniform_warmup.to_csv(
+            output_dir
+            / "g0_region_uniform_warmup_features.csv",
+            index=False,
+        )
+
         region_summary = summarise_features(
-            region_round_level,
+            region_uniform_warmup,
             warmup_rounds=(
                 args.warmup_rounds
             ),
             label_column="region",
+            recent_observations=(
+                args.recent_observations
+            ),
         )
 
         region_summary.to_csv(
@@ -2355,6 +3245,25 @@ def main() -> None:
             args.warmup_rounds
         ),
 
+        "warmup_sampling_step": int(
+            args.warmup_sampling_step
+        ),
+
+        "uniform_warmup_rounds": [
+            int(
+                round_number
+            )
+            for round_number in sorted(
+                uniform_warmup[
+                    "round"
+                ].unique()
+            )
+        ],
+
+        "recent_persistence_observations": int(
+            args.recent_observations
+        ),
+
         "cosine_conflict_threshold": float(
             args.cosine_threshold
         ),
@@ -2394,6 +3303,34 @@ def main() -> None:
                 "the final EC-DAPS sharing score."
             ),
             (
+                "The canonical EC-DAPS warm-up feature "
+                "summary uses evenly spaced federated "
+                "rounds according to "
+                "warmup_sampling_step. This prevents "
+                "densely logged early rounds from receiving "
+                "greater weight simply because they were "
+                "recorded more frequently."
+            ),
+            (
+                "The complete raw logged trajectory is "
+                "preserved in g0_round_level_features.csv. "
+                "The all-logged warm-up summary is preserved "
+                "separately in "
+                "g0_group_feature_summary_all_logged.csv."
+            ),
+            (
+                "P_conflict_fraction and "
+                "P_max_conflict_streak in the canonical "
+                "group summary are calculated on the "
+                "uniformly sampled warm-up grid."
+            ),
+            (
+                "P_recent_conflict_fraction describes "
+                "conflict frequency over the configured "
+                "number of final uniform warm-up "
+                "observations."
+            ),
+            (
                 "C is currently defined as 1 minus "
                 "pairwise cosine similarity."
             ),
@@ -2410,6 +3347,25 @@ def main() -> None:
                 "P currently describes persistence of "
                 "directional conflict under the configured "
                 "cosine threshold."
+            ),
+            (
+                "Q describes compatible/shareable coverage "
+                "for each functional group: the fraction of "
+                "each client's floating-point state-dict "
+                "elements represented by the mutually "
+                "compatible parameter subset."
+            ),
+            (
+                "Q is currently descriptive reliability "
+                "metadata only and is not included in an "
+                "EC-DAPS sharing score or threshold."
+            ),
+            (
+                "For every group with disagreement "
+                "statistics, the analysis verifies that "
+                "Q's compatible parameter count exactly "
+                "matches the parameter_count used for "
+                "C, L, R and P."
             ),
             (
                 "The final EC-DAPS score and threshold "

@@ -58,7 +58,21 @@ parser.add_argument(
     help=(
         "Aggregation mode passed to the server. "
         "'weighted' uses sample-weighted FedAvg. "
-        "'weighted_no_norm' skips normalisation-related parameters as a FedBN-inspired mode."
+        "'weighted_no_norm' skips normalisation-related parameters "
+        "as a FedBN-inspired mode."
+    ),
+)
+
+parser.add_argument(
+    "--local_groups",
+    type=str,
+    nargs="*",
+    default=[],
+    help=(
+        "Functional parameter group(s) deliberately kept "
+        "client-specific by the server during federated training. "
+        "Examples: encoder_stage_0, encoder_stage_3, "
+        "decoder_stage_0, normalisation."
     ),
 )
 parser.add_argument(
@@ -142,6 +156,31 @@ configuration = args.configuration
 port = args.port
 num_rounds = args.num_rounds
 aggregation_mode = args.aggregation_mode
+
+local_groups = sorted(
+    {
+        str(group).strip()
+        for group in args.local_groups
+        if str(group).strip()
+    }
+)
+
+if task != "train" and local_groups:
+    raise ValueError(
+        "--local_groups is only valid for the train task."
+    )
+
+if (
+    aggregation_mode == "weighted_no_norm"
+    and local_groups
+):
+    raise ValueError(
+        "Do not combine weighted_no_norm with --local_groups. "
+        "For controlled personalisation experiments, use "
+        "--aggregation_mode weighted with the required "
+        "--local_groups value."
+    )
+
 server_address = args.server_address
 seed = int(args.seed)
 stats_every = max(1, int(args.stats_every))
@@ -244,9 +283,22 @@ for current_fold in folds:
                 str(num_rounds),
             ]
 
+        if local_groups:
+            server_command += [
+                "--local_groups",
+                *local_groups,
+            ]
+
         print(
             "Server command:",
             " ".join(server_command),
+            flush=True,
+        )
+        print(
+            (
+                "Personalisation policy: "
+                f"local_groups={local_groups}"
+            ),
             flush=True,
         )
         print(
